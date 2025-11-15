@@ -1,5 +1,6 @@
 const std = @import("std");
 const loop = @import("loop.zig");
+const server = @import("server.zig");
 const posix = std.posix;
 
 pub fn main() !void {
@@ -14,10 +15,43 @@ pub fn main() !void {
     // Check if socket exists
     std.fs.accessAbsolute(socket_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
-            std.debug.print("Starting server (socket not found)\n", .{});
-            return;
+            const pid = try posix.fork();
+            if (pid == 0) {
+                // Child process - daemonize
+                _ = posix.setsid() catch |e| {
+                    std.debug.print("setsid failed: {}\n", .{e});
+                    std.posix.exit(1);
+                };
+
+                // Fork again to prevent acquiring controlling terminal
+                const pid2 = try posix.fork();
+                if (pid2 != 0) {
+                    // First child exits
+                    std.posix.exit(0);
+                }
+
+                // Grandchild - actual server daemon
+                // Close stdio
+                posix.close(posix.STDIN_FILENO);
+                posix.close(posix.STDOUT_FILENO);
+                posix.close(posix.STDERR_FILENO);
+
+                // Start server
+                try server.startServer(allocator, socket_path);
+                return;
+            } else {
+                // Parent process - wait for socket to appear
+                std.debug.print("Forked server with PID {}\n", .{pid});
+                var retries: u8 = 0;
+                while (retries < 10) : (retries += 1) {
+                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    std.fs.accessAbsolute(socket_path, .{}) catch continue;
+                    break;
+                }
+            }
+        } else {
+            return err;
         }
-        return err;
     };
 
     std.debug.print("Connecting to server at {s}\n", .{socket_path});
@@ -27,6 +61,7 @@ pub fn main() !void {
 
     const App = struct {
         connected: bool = false,
+        connection_refused: bool = false,
         fd: posix.fd_t = undefined,
 
         fn onConnected(_: *loop.Loop, completion: loop.Completion) anyerror!void {
@@ -39,7 +74,11 @@ pub fn main() !void {
                     std.debug.print("Connected! fd={}\n", .{app.fd});
                 },
                 .err => |err| {
-                    std.debug.print("Connection failed: {}\n", .{err});
+                    if (err == error.ConnectionRefused) {
+                        app.connection_refused = true;
+                    } else {
+                        std.debug.print("Connection failed: {}\n", .{err});
+                    }
                 },
                 else => unreachable,
             }
@@ -55,6 +94,57 @@ pub fn main() !void {
     );
 
     try rt.run(.until_done);
+
+    if (app.connection_refused) {
+        // Stale socket - remove it and fork server
+        std.debug.print("Stale socket detected, removing and starting server\n", .{});
+        posix.unlink(socket_path) catch {};
+
+        const pid = try posix.fork();
+        if (pid == 0) {
+            // Child process - daemonize
+            _ = posix.setsid() catch |e| {
+                std.debug.print("setsid failed: {}\n", .{e});
+                std.posix.exit(1);
+            };
+
+            // Fork again to prevent acquiring controlling terminal
+            const pid2 = try posix.fork();
+            if (pid2 != 0) {
+                // First child exits
+                std.posix.exit(0);
+            }
+
+            // Grandchild - actual server daemon
+            // Close stdio
+            posix.close(posix.STDIN_FILENO);
+            posix.close(posix.STDOUT_FILENO);
+            posix.close(posix.STDERR_FILENO);
+
+            // Start server
+            try server.startServer(allocator, socket_path);
+            return;
+        } else {
+            // Parent process - wait for socket to appear then retry
+            std.debug.print("Forked server with PID {}\n", .{pid});
+            var retries: u8 = 0;
+            while (retries < 10) : (retries += 1) {
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+                std.fs.accessAbsolute(socket_path, .{}) catch continue;
+                break;
+            }
+
+            // Retry connection
+            rt = try loop.Loop.init(allocator);
+            app = .{};
+            _ = try connectUnixSocket(
+                &rt,
+                socket_path,
+                .{ .ptr = &app, .cb = App.onConnected },
+            );
+            try rt.run(.until_done);
+        }
+    }
 
     if (app.connected) {
         defer posix.close(app.fd);

@@ -113,12 +113,19 @@ pub const Loop = struct {
                 }};
                 _ = try posix.kevent(self.kq, &changes, &[_]posix.Kevent{}, null);
             } else {
-                // Immediate error
+                // Immediate error - map known errors
+                const result_err = switch (err) {
+                    .CONNREFUSED => error.ConnectionRefused,
+                    .ACCES => error.AccessDenied,
+                    .TIMEDOUT => error.ConnectionTimedOut,
+                    .NETUNREACH => error.NetworkUnreachable,
+                    else => posix.unexpectedErrno(err),
+                };
                 try ctx.cb(self, .{
                     .userdata = ctx.ptr,
                     .msg = ctx.msg,
                     .callback = ctx.cb,
-                    .result = .{ .err = posix.unexpectedErrno(err) },
+                    .result = .{ .err = result_err },
                 });
             }
         }
@@ -288,11 +295,12 @@ pub const Loop = struct {
                         .result = .{ .connect = {} },
                     });
                 } else {
+                    const err = posix.unexpectedErrno(@enumFromInt(err_code));
                     try ctx.cb(self, .{
                         .userdata = ctx.ptr,
                         .msg = ctx.msg,
                         .callback = ctx.cb,
-                        .result = .{ .err = error.ConnectionFailed },
+                        .result = .{ .err = err },
                     });
                 }
             },

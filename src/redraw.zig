@@ -2,103 +2,75 @@ const std = @import("std");
 const msgpack = @import("msgpack.zig");
 const Allocator = std.mem.Allocator;
 
-/// Neovim-compatible UI protocol for screen updates
+/// Prise UI protocol for screen updates
 /// All updates are sent as notifications: [2, "redraw", [events]]
-/// UI Event types matching Neovim's protocol
 pub const UIEvent = union(enum) {
-    grid_resize: GridResize,
-    grid_line: GridLine,
-    grid_cursor_goto: GridCursorGoto,
-    grid_scroll: GridScroll,
-    grid_clear: GridClear,
-    grid_destroy: GridDestroy,
-    hl_attr_define: HlAttrDefine,
-    default_colors_set: DefaultColorsSet,
+    resize: Resize,
+    write: Write,
+    cursor_pos: CursorPos,
+    cursor_shape: CursorShape,
+    style: Style,
     flush: void,
 
-    /// ["grid_resize", grid, width, height]
-    pub const GridResize = struct {
-        grid: u32,
-        width: u32,
-        height: u32,
+    /// ["resize", pty, rows, cols]
+    pub const Resize = struct {
+        pty: u32,
+        rows: u16,
+        cols: u16,
     };
 
-    /// ["grid_line", grid, row, col_start, cells, wrap]
-    /// where cells is an array of [text, hl_id, repeat]
-    pub const GridLine = struct {
-        grid: u32,
-        row: u32,
-        col_start: u32,
+    /// ["write", pty, row, col, cells]
+    /// where cells is an array of [grapheme, style_id?, repeat?]
+    pub const Write = struct {
+        pty: u32,
+        row: u16,
+        col: u16,
         cells: []Cell,
-        wrap: bool,
 
         pub const Cell = struct {
-            text: []const u8,
-            hl_id: ?u32 = null, // omitted = reuse previous
+            grapheme: []const u8,
+            style_id: ?u32 = null, // omitted = reuse previous
             repeat: ?u32 = null, // omitted = 1
         };
     };
 
-    /// ["grid_cursor_goto", grid, row, col]
-    pub const GridCursorGoto = struct {
-        grid: u32,
-        row: u32,
-        col: u32,
+    /// ["cursor_pos", pty, row, col]
+    pub const CursorPos = struct {
+        pty: u32,
+        row: u16,
+        col: u16,
     };
 
-    /// ["grid_scroll", grid, top, bot, left, right, rows, cols]
-    pub const GridScroll = struct {
-        grid: u32,
-        top: u32,
-        bot: u32,
-        left: u32,
-        right: u32,
-        rows: i32, // + = up, - = down
-        cols: i32, // always 0 for now
-    };
+    /// ["cursor_shape", pty, shape]
+    /// shape: 0=block, 1=beam, 2=underline
+    pub const CursorShape = struct {
+        pty: u32,
+        shape: Shape,
 
-    /// ["grid_clear", grid]
-    pub const GridClear = struct {
-        grid: u32,
-    };
-
-    /// ["grid_destroy", grid]
-    pub const GridDestroy = struct {
-        grid: u32,
-    };
-
-    /// ["hl_attr_define", id, rgb_attr, cterm_attr, info]
-    pub const HlAttrDefine = struct {
-        id: u32,
-        rgb_attr: HlAttrs,
-        cterm_attr: HlAttrs,
-        info: []const u8, // empty array unless ext_hlstate enabled
-
-        pub const HlAttrs = struct {
-            foreground: ?u32 = null,
-            background: ?u32 = null,
-            special: ?u32 = null,
-            reverse: bool = false,
-            italic: bool = false,
-            bold: bool = false,
-            strikethrough: bool = false,
-            underline: bool = false,
-            undercurl: bool = false,
-            underdouble: bool = false,
-            underdotted: bool = false,
-            underdashed: bool = false,
-            blend: ?u8 = null, // 0-100
-            url: ?[]const u8 = null,
+        pub const Shape = enum(u8) {
+            block = 0,
+            beam = 1,
+            underline = 2,
         };
     };
 
-    /// ["default_colors_set", rgb_fg, rgb_bg, rgb_sp, cterm_fg, cterm_bg]
-    pub const DefaultColorsSet = struct {
-        rgb_fg: u32,
-        rgb_bg: u32,
-        rgb_sp: u32,
-        cterm_fg: u32,
-        cterm_bg: u32,
+    /// ["style", id, attributes]
+    pub const Style = struct {
+        id: u32,
+        attrs: Attributes,
+
+        pub const Attributes = struct {
+            fg: ?u32 = null, // RGB
+            bg: ?u32 = null, // RGB
+            fg_idx: ?u8 = null, // Index
+            bg_idx: ?u8 = null, // Index
+            bold: bool = false,
+            dim: bool = false,
+            italic: bool = false,
+            underline: bool = false,
+            reverse: bool = false,
+            blink: bool = false,
+        };
     };
 };
 
@@ -121,15 +93,15 @@ pub const RedrawBuilder = struct {
         self.events.deinit(self.allocator);
     }
 
-    /// Add a grid_resize event
-    pub fn gridResize(self: *RedrawBuilder, grid: u32, width: u32, height: u32) !void {
-        // Event format: ["grid_resize", [grid, width, height]]
-        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "grid_resize") };
+    /// Add a resize event
+    pub fn resize(self: *RedrawBuilder, pty: u32, rows: u16, cols: u16) !void {
+        // Event format: ["resize", [pty, rows, cols]]
+        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "resize") };
 
         const args = try self.allocator.alloc(msgpack.Value, 3);
-        args[0] = msgpack.Value{ .unsigned = grid };
-        args[1] = msgpack.Value{ .unsigned = width };
-        args[2] = msgpack.Value{ .unsigned = height };
+        args[0] = msgpack.Value{ .unsigned = pty };
+        args[1] = msgpack.Value{ .unsigned = rows };
+        args[2] = msgpack.Value{ .unsigned = cols };
 
         const args_array = msgpack.Value{ .array = args };
 
@@ -141,17 +113,16 @@ pub const RedrawBuilder = struct {
         try self.events.append(self.allocator, msgpack.Value{ .array = event_arr });
     }
 
-    /// Add a grid_line event
-    pub fn gridLine(
+    /// Add a write event
+    pub fn write(
         self: *RedrawBuilder,
-        grid: u32,
-        row: u32,
-        col_start: u32,
-        cells: []const UIEvent.GridLine.Cell,
-        wrap: bool,
+        pty: u32,
+        row: u16,
+        col: u16,
+        cells: []const UIEvent.Write.Cell,
     ) !void {
-        // Event format: ["grid_line", [grid, row, col_start, cells, wrap]]
-        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "grid_line") };
+        // Event format: ["write", [pty, row, col, cells]]
+        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "write") };
 
         // Build cells array
         const cells_arr = try self.allocator.alloc(msgpack.Value, cells.len);
@@ -159,18 +130,18 @@ pub const RedrawBuilder = struct {
             var cell_items = std.ArrayList(msgpack.Value).empty;
             defer cell_items.deinit(self.allocator);
 
-            // Always include text
-            try cell_items.append(self.allocator, msgpack.Value{ .string = try self.allocator.dupe(u8, cell.text) });
+            // Always include grapheme
+            try cell_items.append(self.allocator, msgpack.Value{ .string = try self.allocator.dupe(u8, cell.grapheme) });
 
-            // Include hl_id if present
-            if (cell.hl_id) |hl| {
-                try cell_items.append(self.allocator, msgpack.Value{ .unsigned = hl });
+            // Include style_id if present
+            if (cell.style_id) |sid| {
+                try cell_items.append(self.allocator, msgpack.Value{ .unsigned = sid });
             }
 
-            // Include repeat if present and hl_id was included
+            // Include repeat if present and style_id was included
             if (cell.repeat) |rep| {
-                if (cell.hl_id == null) {
-                    // If no hl_id, we need to include nil placeholder
+                if (cell.style_id == null) {
+                    // If no style_id, we need to include nil placeholder
                     try cell_items.insert(self.allocator, 1, msgpack.Value.nil);
                 }
                 try cell_items.append(self.allocator, msgpack.Value{ .unsigned = rep });
@@ -179,12 +150,11 @@ pub const RedrawBuilder = struct {
             cells_arr[i] = msgpack.Value{ .array = try cell_items.toOwnedSlice(self.allocator) };
         }
 
-        const args = try self.allocator.alloc(msgpack.Value, 5);
-        args[0] = msgpack.Value{ .unsigned = grid };
+        const args = try self.allocator.alloc(msgpack.Value, 4);
+        args[0] = msgpack.Value{ .unsigned = pty };
         args[1] = msgpack.Value{ .unsigned = row };
-        args[2] = msgpack.Value{ .unsigned = col_start };
+        args[2] = msgpack.Value{ .unsigned = col };
         args[3] = msgpack.Value{ .array = cells_arr };
-        args[4] = msgpack.Value{ .boolean = wrap };
 
         const args_array = msgpack.Value{ .array = args };
 
@@ -195,12 +165,12 @@ pub const RedrawBuilder = struct {
         try self.events.append(self.allocator, msgpack.Value{ .array = event_arr });
     }
 
-    /// Add a grid_cursor_goto event
-    pub fn gridCursorGoto(self: *RedrawBuilder, grid: u32, row: u32, col: u32) !void {
-        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "grid_cursor_goto") };
+    /// Add a cursor_pos event
+    pub fn cursorPos(self: *RedrawBuilder, pty: u32, row: u16, col: u16) !void {
+        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "cursor_pos") };
 
         const args = try self.allocator.alloc(msgpack.Value, 3);
-        args[0] = msgpack.Value{ .unsigned = grid };
+        args[0] = msgpack.Value{ .unsigned = pty };
         args[1] = msgpack.Value{ .unsigned = row };
         args[2] = msgpack.Value{ .unsigned = col };
 
@@ -213,12 +183,13 @@ pub const RedrawBuilder = struct {
         try self.events.append(self.allocator, msgpack.Value{ .array = event_arr });
     }
 
-    /// Add a grid_clear event
-    pub fn gridClear(self: *RedrawBuilder, grid: u32) !void {
-        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "grid_clear") };
+    /// Add a cursor_shape event
+    pub fn cursorShape(self: *RedrawBuilder, pty: u32, shape: UIEvent.CursorShape.Shape) !void {
+        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "cursor_shape") };
 
-        const args = try self.allocator.alloc(msgpack.Value, 1);
-        args[0] = msgpack.Value{ .unsigned = grid };
+        const args = try self.allocator.alloc(msgpack.Value, 2);
+        args[0] = msgpack.Value{ .unsigned = pty };
+        args[1] = msgpack.Value{ .unsigned = @intFromEnum(shape) };
 
         const args_array = msgpack.Value{ .array = args };
 
@@ -233,7 +204,6 @@ pub const RedrawBuilder = struct {
     pub fn flush(self: *RedrawBuilder) !void {
         const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "flush") };
 
-        // Flush has empty args
         const args = try self.allocator.alloc(msgpack.Value, 0);
         const args_array = msgpack.Value{ .array = args };
 
@@ -244,29 +214,86 @@ pub const RedrawBuilder = struct {
         try self.events.append(self.allocator, msgpack.Value{ .array = event_arr });
     }
 
-    /// Add a hl_attr_define event
-    pub fn hlAttrDefine(
+    /// Add a style event
+    pub fn style(
         self: *RedrawBuilder,
         id: u32,
-        rgb_attr: UIEvent.HlAttrDefine.HlAttrs,
-        cterm_attr: UIEvent.HlAttrDefine.HlAttrs,
+        attrs: UIEvent.Style.Attributes,
     ) !void {
-        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "hl_attr_define") };
+        const event_name = msgpack.Value{ .string = try self.allocator.dupe(u8, "style") };
 
-        // Build rgb_attr map
-        const rgb_map = try buildHlAttrsMap(self.allocator, rgb_attr);
+        var items = std.ArrayList(msgpack.Value.KeyValue).empty;
+        defer items.deinit(self.allocator);
 
-        // Build cterm_attr map
-        const cterm_map = try buildHlAttrsMap(self.allocator, cterm_attr);
+        if (attrs.fg) |fg| {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "fg") },
+                .value = msgpack.Value{ .unsigned = fg },
+            });
+        } else if (attrs.fg_idx) |fg_idx| {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "fg_idx") },
+                .value = msgpack.Value{ .unsigned = fg_idx },
+            });
+        }
 
-        // Build empty info array
-        const info_arr = try self.allocator.alloc(msgpack.Value, 0);
+        if (attrs.bg) |bg| {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "bg") },
+                .value = msgpack.Value{ .unsigned = bg },
+            });
+        } else if (attrs.bg_idx) |bg_idx| {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "bg_idx") },
+                .value = msgpack.Value{ .unsigned = bg_idx },
+            });
+        }
 
-        const args = try self.allocator.alloc(msgpack.Value, 4);
+        if (attrs.bold) {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "bold") },
+                .value = msgpack.Value{ .boolean = true },
+            });
+        }
+
+        if (attrs.dim) {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "dim") },
+                .value = msgpack.Value{ .boolean = true },
+            });
+        }
+
+        if (attrs.italic) {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "italic") },
+                .value = msgpack.Value{ .boolean = true },
+            });
+        }
+
+        if (attrs.underline) {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "underline") },
+                .value = msgpack.Value{ .boolean = true },
+            });
+        }
+
+        if (attrs.reverse) {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "reverse") },
+                .value = msgpack.Value{ .boolean = true },
+            });
+        }
+
+        if (attrs.blink) {
+            try items.append(self.allocator, .{
+                .key = msgpack.Value{ .string = try self.allocator.dupe(u8, "blink") },
+                .value = msgpack.Value{ .boolean = true },
+            });
+        }
+
+        const args = try self.allocator.alloc(msgpack.Value, 2);
         args[0] = msgpack.Value{ .unsigned = id };
-        args[1] = msgpack.Value{ .map = rgb_map };
-        args[2] = msgpack.Value{ .map = cterm_map };
-        args[3] = msgpack.Value{ .array = info_arr };
+        args[1] = msgpack.Value{ .map = try items.toOwnedSlice(self.allocator) };
 
         const args_array = msgpack.Value{ .array = args };
 
@@ -292,104 +319,18 @@ pub const RedrawBuilder = struct {
     }
 };
 
-/// Helper function to build HlAttrs map
-fn buildHlAttrsMap(allocator: Allocator, attrs: UIEvent.HlAttrDefine.HlAttrs) ![]msgpack.Value.KeyValue {
-    var items = std.ArrayList(msgpack.Value.KeyValue).empty;
-    defer items.deinit(allocator);
-
-    if (attrs.foreground) |fg| {
-        try items.append(allocator, .{
-            .key = msgpack.Value{ .string = try allocator.dupe(u8, "foreground") },
-            .value = msgpack.Value{ .unsigned = fg },
-        });
-    }
-
-    if (attrs.background) |bg| {
-        try items.append(allocator, .{
-            .key = msgpack.Value{ .string = try allocator.dupe(u8, "background") },
-            .value = msgpack.Value{ .unsigned = bg },
-        });
-    }
-
-    if (attrs.special) |sp| {
-        try items.append(allocator, .{
-            .key = msgpack.Value{ .string = try allocator.dupe(u8, "special") },
-            .value = msgpack.Value{ .unsigned = sp },
-        });
-    }
-
-    if (attrs.reverse) {
-        try items.append(allocator, .{
-            .key = msgpack.Value{ .string = try allocator.dupe(u8, "reverse") },
-            .value = msgpack.Value{ .boolean = true },
-        });
-    }
-
-    if (attrs.italic) {
-        try items.append(allocator, .{
-            .key = msgpack.Value{ .string = try allocator.dupe(u8, "italic") },
-            .value = msgpack.Value{ .boolean = true },
-        });
-    }
-
-    if (attrs.bold) {
-        try items.append(allocator, .{
-            .key = msgpack.Value{ .string = try allocator.dupe(u8, "bold") },
-            .value = msgpack.Value{ .boolean = true },
-        });
-    }
-
-    if (attrs.blend) |blend| {
-        try items.append(allocator, .{
-            .key = msgpack.Value{ .string = try allocator.dupe(u8, "blend") },
-            .value = msgpack.Value{ .unsigned = blend },
-        });
-    }
-
-    return try items.toOwnedSlice(allocator);
-}
-
 const testing = std.testing;
 
-test "build grid_resize event" {
+test "build resize event" {
     var builder = RedrawBuilder.init(testing.allocator);
     defer builder.deinit();
 
-    try builder.gridResize(1, 80, 24);
+    try builder.resize(1, 24, 80);
     try builder.flush();
 
     const msg = try builder.build();
     defer testing.allocator.free(msg);
 
-    // Decode and verify
-    const value = try msgpack.decode(testing.allocator, msg);
-    defer value.deinit(testing.allocator);
-
-    try testing.expect(value == .array);
-    try testing.expectEqual(@as(usize, 3), value.array.len);
-    try testing.expectEqual(@as(u64, 2), value.array[0].unsigned); // type = notification
-    try testing.expectEqualStrings("redraw", value.array[1].string);
-}
-
-test "build grid_line event" {
-    var builder = RedrawBuilder.init(testing.allocator);
-    defer builder.deinit();
-
-    const cells = [_]UIEvent.GridLine.Cell{
-        .{ .text = "H", .hl_id = 0 },
-        .{ .text = "e", .hl_id = 0 },
-        .{ .text = "l", .hl_id = 0 },
-        .{ .text = "l", .hl_id = 0 },
-        .{ .text = "o", .hl_id = 0 },
-    };
-
-    try builder.gridLine(1, 0, 0, &cells, false);
-    try builder.flush();
-
-    const msg = try builder.build();
-    defer testing.allocator.free(msg);
-
-    // Verify it's a valid msgpack message
     const value = try msgpack.decode(testing.allocator, msg);
     defer value.deinit(testing.allocator);
 
@@ -398,19 +339,52 @@ test "build grid_line event" {
     try testing.expectEqualStrings("redraw", value.array[1].string);
 }
 
+test "build write event" {
+    var builder = RedrawBuilder.init(testing.allocator);
+    defer builder.deinit();
+
+    const cells = [_]UIEvent.Write.Cell{
+        .{ .grapheme = "H", .style_id = 0 },
+        .{ .grapheme = "e", .style_id = 0 },
+        .{ .grapheme = "l", .style_id = 0 },
+        .{ .grapheme = "l", .style_id = 0 },
+        .{ .grapheme = "o", .style_id = 0 },
+    };
+
+    try builder.write(1, 0, 0, &cells);
+    try builder.flush();
+
+    const msg = try builder.build();
+    defer testing.allocator.free(msg);
+
+    const value = try msgpack.decode(testing.allocator, msg);
+    defer value.deinit(testing.allocator);
+
+    try testing.expect(value == .array);
+}
+
 test "build complete redraw notification" {
     var builder = RedrawBuilder.init(testing.allocator);
     defer builder.deinit();
 
-    // Typical redraw sequence
-    try builder.gridResize(1, 80, 24);
+    // Resize pty 1
+    try builder.resize(1, 24, 80);
 
-    const cells = [_]UIEvent.GridLine.Cell{
-        .{ .text = "~", .hl_id = 7, .repeat = 80 },
+    // Define style 1 (Red foreground)
+    try builder.style(1, .{ .fg = 0xFF0000, .bold = true });
+
+    // Write line
+    const cells = [_]UIEvent.Write.Cell{
+        .{ .grapheme = "H", .style_id = 1 },
+        .{ .grapheme = "i", .style_id = 1 },
+        .{ .grapheme = " ", .repeat = 5, .style_id = 1 },
     };
-    try builder.gridLine(1, 0, 0, &cells, false);
+    try builder.write(1, 0, 0, &cells);
 
-    try builder.gridCursorGoto(1, 0, 0);
+    // Move cursor
+    try builder.cursorPos(1, 0, 7);
+    try builder.cursorShape(1, .beam);
+
     try builder.flush();
 
     const msg = try builder.build();
@@ -428,7 +402,7 @@ test "build complete redraw notification" {
     try testing.expectEqualStrings("redraw", value.array[1].string);
     try testing.expect(value.array[2] == .array);
 
-    // Check we have 4 events
+    // Check we have 6 events
     const events = value.array[2].array;
-    try testing.expectEqual(@as(usize, 4), events.len);
+    try testing.expectEqual(@as(usize, 6), events.len);
 }

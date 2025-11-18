@@ -9,8 +9,11 @@ back: *vaxis.AllocatingScreen,
 allocator: std.mem.Allocator,
 rows: u16,
 cols: u16,
+cursor_shape: redraw.UIEvent.CursorShape.Shape = .block,
 dirty: bool = false,
 hl_attrs: std.AutoHashMap(u32, vaxis.Style),
+
+const redraw = @import("redraw.zig");
 
 pub fn init(allocator: std.mem.Allocator, rows: u16, cols: u16) !Surface {
     const front = try allocator.create(vaxis.AllocatingScreen);
@@ -65,7 +68,7 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
     defer rows_updated.deinit(self.allocator);
 
     // Don't reset the arena or copy - back buffer already has the full state from last render
-    // grid_line events will update only changed rows
+    // write events will update only changed rows
     // The arena keeps growing but only with new/changed cell text
 
     for (params.array) |event_val| {
@@ -77,28 +80,30 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
         const event_params = event_val.array[1];
         if (event_params != .array) continue;
 
-        if (std.mem.eql(u8, event_name.string, "grid_resize")) {
+        if (std.mem.eql(u8, event_name.string, "resize")) {
             if (event_params.array.len < 3) continue;
 
-            const width = switch (event_params.array[1]) {
+            // args: [pty, rows, cols]
+            const rows = switch (event_params.array[1]) {
                 .unsigned => |u| @as(u16, @intCast(u)),
                 .integer => |i| @as(u16, @intCast(i)),
                 else => continue,
             };
-            const height = switch (event_params.array[2]) {
+            const cols = switch (event_params.array[2]) {
                 .unsigned => |u| @as(u16, @intCast(u)),
                 .integer => |i| @as(u16, @intCast(i)),
                 else => continue,
             };
 
             // Only resize if dimensions actually changed
-            if (height != self.rows or width != self.cols) {
-                std.log.debug("grid_resize: resizing from {}x{} to {}x{}", .{ self.cols, self.rows, width, height });
-                try self.resize(height, width);
+            if (rows != self.rows or cols != self.cols) {
+                std.log.debug("resize: resizing from {}x{} to {}x{}", .{ self.cols, self.rows, cols, rows });
+                try self.resize(rows, cols);
             }
-        } else if (std.mem.eql(u8, event_name.string, "grid_cursor_goto")) {
+        } else if (std.mem.eql(u8, event_name.string, "cursor_pos")) {
             if (event_params.array.len < 3) continue;
 
+            // args: [pty, row, col]
             const row = switch (event_params.array[1]) {
                 .unsigned => |u| @as(u16, @intCast(u)),
                 .integer => |i| @as(u16, @intCast(i)),
@@ -114,9 +119,22 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
             self.back.cursor_col = col;
             self.back.cursor_vis = true;
             self.dirty = true;
-        } else if (std.mem.eql(u8, event_name.string, "grid_line")) {
+        } else if (std.mem.eql(u8, event_name.string, "cursor_shape")) {
+            if (event_params.array.len < 2) continue;
+
+            // args: [pty, shape]
+            const shape_int = switch (event_params.array[1]) {
+                .unsigned => |u| @as(u8, @intCast(u)),
+                .integer => |i| @as(u8, @intCast(i)),
+                else => continue,
+            };
+
+            self.cursor_shape = @enumFromInt(shape_int);
+            self.dirty = true;
+        } else if (std.mem.eql(u8, event_name.string, "write")) {
             if (event_params.array.len < 4) continue;
 
+            // args: [pty, row, col, cells]
             const row = switch (event_params.array[1]) {
                 .unsigned => |u| @as(usize, @intCast(u)),
                 .integer => |i| @as(usize, @intCast(i)),
@@ -133,20 +151,11 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
 
             try rows_updated.append(self.allocator, row);
 
-            // Log first few cells for row 0 to debug
-            if (row == 0 and cells.array.len > 0) {
-                std.log.debug("grid_line: ROW 0: col={}, cells={}, first cell text='{s}'", .{ col, cells.array.len, if (cells.array[0] == .array and cells.array[0].array.len > 0 and cells.array[0].array[0] == .string)
-                    cells.array[0].array[0].string
-                else
-                    "(not string)" });
-            }
-
-            std.log.debug("grid_line: row={}, col={}, cells={} (updating back buffer)", .{ row, col, cells.array.len });
-
             var current_hl: u32 = 0;
             for (cells.array) |cell| {
                 if (cell != .array or cell.array.len == 0) continue;
 
+                // cell: [grapheme, style_id?, repeat?]
                 const text = if (cell.array[0] == .string) cell.array[0].string else " ";
 
                 if (cell.array.len > 1 and cell.array[1] != .nil) {
@@ -171,11 +180,6 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
                 var i: usize = 0;
                 while (i < repeat) : (i += 1) {
                     if (col < self.cols and row < self.rows) {
-                        // Debug: log ALL writes to row 0
-                        if (row == 0 and col <= 5) {
-                            std.log.debug("  writing to ({},{}) text='{s}' repeat={}", .{ col, row, text, repeat });
-                        }
-
                         self.back.writeCell(@intCast(col), @intCast(row), .{
                             .char = .{ .grapheme = text },
                             .style = style,
@@ -185,85 +189,71 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
                 }
             }
             self.dirty = true;
-        } else if (std.mem.eql(u8, event_name.string, "grid_clear")) {
-            std.log.warn("grid_clear received! Clearing back buffer", .{});
-            // Clear all cells in back buffer
-            for (0..self.rows) |row| {
-                for (0..self.cols) |col| {
-                    self.back.writeCell(@intCast(col), @intCast(row), .{});
-                }
-            }
-            self.dirty = true;
-        } else if (std.mem.eql(u8, event_name.string, "hl_attr_define")) {
+        } else if (std.mem.eql(u8, event_name.string, "style")) {
             if (event_params.array.len < 2) continue;
 
+            // args: [id, map]
             const id = switch (event_params.array[0]) {
                 .unsigned => |u| @as(u32, @intCast(u)),
                 .integer => |i| @as(u32, @intCast(i)),
                 else => continue,
             };
 
-            const rgb_attrs = event_params.array[1];
-            if (rgb_attrs != .map) continue;
+            const attrs = event_params.array[1];
+            if (attrs != .map) continue;
 
             var style = vaxis.Style{};
 
-            for (rgb_attrs.map) |kv| {
+            for (attrs.map) |kv| {
                 if (kv.key != .string) continue;
+                const key = kv.key.string;
 
-                if (std.mem.eql(u8, kv.key.string, "foreground")) {
+                if (std.mem.eql(u8, key, "fg")) {
                     if (kv.value == .unsigned) {
                         const val = @as(u32, @intCast(kv.value.unsigned));
-                        if (val < 256) {
-                            style.fg = .{ .index = @intCast(val) };
-                        } else {
-                            style.fg = .{ .rgb = .{
-                                @intCast((val >> 16) & 0xFF),
-                                @intCast((val >> 8) & 0xFF),
-                                @intCast(val & 0xFF),
-                            } };
-                        }
+                        style.fg = .{ .rgb = .{
+                            @intCast((val >> 16) & 0xFF),
+                            @intCast((val >> 8) & 0xFF),
+                            @intCast(val & 0xFF),
+                        } };
                     }
-                } else if (std.mem.eql(u8, kv.key.string, "background")) {
+                } else if (std.mem.eql(u8, key, "fg_idx")) {
+                    if (kv.value == .unsigned) {
+                        style.fg = .{ .index = @intCast(kv.value.unsigned) };
+                    }
+                } else if (std.mem.eql(u8, key, "bg")) {
                     if (kv.value == .unsigned) {
                         const val = @as(u32, @intCast(kv.value.unsigned));
-                        if (val < 256) {
-                            style.bg = .{ .index = @intCast(val) };
-                        } else {
-                            style.bg = .{ .rgb = .{
-                                @intCast((val >> 16) & 0xFF),
-                                @intCast((val >> 8) & 0xFF),
-                                @intCast(val & 0xFF),
-                            } };
-                        }
+                        style.bg = .{ .rgb = .{
+                            @intCast((val >> 16) & 0xFF),
+                            @intCast((val >> 8) & 0xFF),
+                            @intCast(val & 0xFF),
+                        } };
                     }
-                } else if (std.mem.eql(u8, kv.key.string, "bold")) {
-                    if (kv.value == .boolean and kv.value.boolean) {
-                        style.bold = true;
+                } else if (std.mem.eql(u8, key, "bg_idx")) {
+                    if (kv.value == .unsigned) {
+                        style.bg = .{ .index = @intCast(kv.value.unsigned) };
                     }
-                } else if (std.mem.eql(u8, kv.key.string, "italic")) {
-                    if (kv.value == .boolean and kv.value.boolean) {
-                        style.italic = true;
-                    }
-                } else if (std.mem.eql(u8, kv.key.string, "underline")) {
+                } else if (std.mem.eql(u8, key, "bold")) {
+                    if (kv.value == .boolean) style.bold = kv.value.boolean;
+                } else if (std.mem.eql(u8, key, "dim")) {
+                    if (kv.value == .boolean) style.dim = kv.value.boolean;
+                } else if (std.mem.eql(u8, key, "italic")) {
+                    if (kv.value == .boolean) style.italic = kv.value.boolean;
+                } else if (std.mem.eql(u8, key, "underline")) {
                     if (kv.value == .boolean and kv.value.boolean) {
                         style.ul_style = .single;
                     }
-                } else if (std.mem.eql(u8, kv.key.string, "reverse")) {
-                    if (kv.value == .boolean and kv.value.boolean) {
-                        style.reverse = true;
-                    }
+                } else if (std.mem.eql(u8, key, "reverse")) {
+                    if (kv.value == .boolean) style.reverse = kv.value.boolean;
+                } else if (std.mem.eql(u8, key, "blink")) {
+                    if (kv.value == .boolean) style.blink = kv.value.boolean;
                 }
             }
 
             try self.hl_attrs.put(id, style);
         } else if (std.mem.eql(u8, event_name.string, "flush")) {
             // Flush marks the end of a frame - copy back to front now
-
-            // Debug: check what's in back buffer at (0,0)
-            if (self.back.readCell(0, 0)) |cell| {
-                std.log.debug("flush: back(0,0) = '{s}'", .{cell.char.grapheme});
-            }
 
             std.log.debug("flush: copying back→front", .{});
             for (0..self.rows) |row| {
@@ -317,6 +307,12 @@ pub fn render(self: *Surface, win: vaxis.Window) void {
         self.front.cursor_row < win.height)
     {
         win.showCursor(self.front.cursor_col, self.front.cursor_row);
+        const shape: vaxis.Cell.CursorShape = switch (self.cursor_shape) {
+            .block => .block,
+            .beam => .beam,
+            .underline => .underline,
+        };
+        win.setCursorShape(shape);
     } else {
         win.hideCursor();
     }

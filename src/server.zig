@@ -8,6 +8,7 @@ const key_encode = @import("key_encode.zig");
 const posix = std.posix;
 const ghostty_vt = @import("ghostty-vt");
 const vt_handler = @import("vt_handler.zig");
+const redraw = @import("redraw.zig");
 
 const Pty = struct {
     id: usize,
@@ -151,10 +152,9 @@ const Pty = struct {
     }
 };
 
-/// Convert ghostty style to Neovim HlAttrs format
-fn convertStyle(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal, style_id: u16) !@import("redraw.zig").UIEvent.HlAttrDefine.HlAttrs {
+/// Convert ghostty style to Prise Style Attributes
+fn convertStyle(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal, style_id: u16) redraw.UIEvent.Style.Attributes {
     _ = allocator;
-    const redraw = @import("redraw.zig");
 
     if (style_id == 0) {
         // Default style - return empty attrs
@@ -165,17 +165,16 @@ fn convertStyle(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal, st
     const page = &screen.cursor.page_pin.node.data;
     const style = page.styles.get(page.memory, style_id);
 
-    var attrs: redraw.UIEvent.HlAttrDefine.HlAttrs = .{};
+    var attrs: redraw.UIEvent.Style.Attributes = .{};
 
     // Convert foreground color
     switch (style.fg_color) {
         .none => {},
         .palette => |idx| {
-            // Send palette index directly
-            attrs.foreground = idx;
+            attrs.fg_idx = @intCast(idx);
         },
         .rgb => |rgb| {
-            attrs.foreground = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
+            attrs.fg = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
         },
     }
 
@@ -183,29 +182,24 @@ fn convertStyle(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal, st
     switch (style.bg_color) {
         .none => {},
         .palette => |idx| {
-            attrs.background = idx;
+            attrs.bg_idx = @intCast(idx);
         },
         .rgb => |rgb| {
-            attrs.background = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
+            attrs.bg = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
         },
     }
 
     // Convert underline color
-    switch (style.underline_color) {
-        .none => {},
-        .palette => |idx| {
-            _ = idx;
-        },
-        .rgb => |rgb| {
-            attrs.special = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
-        },
-    }
+    // Note: Prise protocol doesn't support underline color yet, ignoring it
+    // (We could add it to Attributes if needed)
 
     // Convert flags
     attrs.bold = style.flags.bold;
     attrs.italic = style.flags.italic;
     attrs.reverse = style.flags.inverse;
-    attrs.strikethrough = style.flags.strikethrough;
+    attrs.blink = style.flags.blink;
+    // strikethrough not supported in our protocol yet
+    // dim not supported in ghostty flags? or named differently
 
     // Handle underline variants
     attrs.underline = switch (style.flags.underline) {
@@ -223,8 +217,9 @@ const ScreenState = struct {
     cols: usize,
     cursor_x: usize,
     cursor_y: usize,
+    cursor_shape: redraw.UIEvent.CursorShape.Shape,
     rows_data: []DirtyRow,
-    styles: std.AutoHashMap(u16, @import("redraw.zig").UIEvent.HlAttrDefine.HlAttrs),
+    styles: std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes),
     allocator: std.mem.Allocator,
 
     pub const RenderMode = enum { full, incremental };
@@ -250,7 +245,7 @@ const ScreenState = struct {
         const rows = page.size.rows;
         const cols = page.size.cols;
 
-        var styles = std.AutoHashMap(u16, @import("redraw.zig").UIEvent.HlAttrDefine.HlAttrs).init(allocator);
+        var styles = std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes).init(allocator);
         errdefer styles.deinit();
 
         var rows_data = std.ArrayList(DirtyRow).empty;
@@ -386,17 +381,24 @@ const ScreenState = struct {
         for (rows_data.items) |row| {
             for (row.cells) |cell| {
                 if (cell.style_id != 0 and !styles.contains(cell.style_id)) {
-                    const attrs = try convertStyle(allocator, terminal, cell.style_id);
+                    const attrs = convertStyle(allocator, terminal, cell.style_id);
                     try styles.put(cell.style_id, attrs);
                 }
             }
         }
+
+        const cursor_shape: redraw.UIEvent.CursorShape.Shape = switch (screen.cursor.cursor_style) {
+            .block, .block_hollow => .block,
+            .bar => .beam,
+            .underline => .underline,
+        };
 
         return .{
             .rows = rows,
             .cols = cols,
             .cursor_x = screen.cursor.x,
             .cursor_y = screen.cursor.y,
+            .cursor_shape = cursor_shape,
             .rows_data = try rows_data.toOwnedSlice(allocator),
             .styles = styles,
             .allocator = allocator,
@@ -1002,8 +1004,6 @@ const Server = struct {
 
     /// Build and send redraw notification for a session to attached clients
     fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, state: *ScreenState, target_client: ?*Client, mode: ScreenState.RenderMode) !void {
-        const redraw = @import("redraw.zig");
-
         std.log.debug("sendRedraw: session={} rows={} cols={} mode={} target_client={} total_clients={}", .{ pty_instance.id, state.rows, state.cols, mode, target_client != null, self.clients.items.len });
 
         // Send to each client attached to this session
@@ -1033,9 +1033,11 @@ const Server = struct {
             var builder = redraw.RedrawBuilder.init(self.allocator);
             defer builder.deinit();
 
-            // Send grid_resize only on full redraw
+            // Send resize only on full redraw or if client hasn't seen it?
+            // Protocol says "resize" is an event.
+            // For simplicity, always send resize on full redraw.
             if (mode == .full) {
-                try builder.gridResize(1, @intCast(state.cols), @intCast(state.rows));
+                try builder.resize(@intCast(pty_instance.id), @intCast(state.rows), @intCast(state.cols));
             }
 
             // Track which styles we need to define
@@ -1055,14 +1057,17 @@ const Server = struct {
             // Define new styles
             for (styles_to_define.items) |style_id| {
                 if (state.styles.get(style_id)) |attrs| {
-                    try builder.hlAttrDefine(style_id, attrs, attrs);
+                    try builder.style(style_id, attrs);
                 }
             }
 
-            // Build grid_line events for each dirty row
+            // Build write events for each dirty row
             for (state.rows_data) |row| {
-                var cells_buf = std.ArrayList(redraw.UIEvent.GridLine.Cell).empty;
+                var cells_buf = std.ArrayList(redraw.UIEvent.Write.Cell).empty;
                 defer cells_buf.deinit(self.allocator);
+
+                // Track the last style ID sent to optimize output
+                var last_hl_id: u32 = 0;
 
                 var x: usize = 0;
                 while (x < state.cols) {
@@ -1091,9 +1096,16 @@ const Server = struct {
                         if (next_cell.wide) next_x += 1;
                     }
 
+                    // Determine if we need to send the style ID
+                    // We send it if it's different from the last one we sent (or implied)
+                    const hl_id_to_send: ?u32 = if (cell.style_id != last_hl_id) cell.style_id else null;
+                    if (hl_id_to_send) |id| {
+                        last_hl_id = id;
+                    }
+
                     try cells_buf.append(self.allocator, .{
-                        .text = cell.text,
-                        .hl_id = if (cell.style_id == 0) null else cell.style_id,
+                        .grapheme = cell.text,
+                        .style_id = hl_id_to_send,
                         .repeat = if (repeat > 1) @intCast(repeat) else null,
                     });
 
@@ -1101,12 +1113,15 @@ const Server = struct {
                 }
 
                 if (cells_buf.items.len > 0) {
-                    try builder.gridLine(1, @intCast(row.y), 0, cells_buf.items, false);
+                    try builder.write(@intCast(pty_instance.id), @intCast(row.y), 0, cells_buf.items);
                 }
             }
 
             // Send cursor position
-            try builder.gridCursorGoto(1, @intCast(state.cursor_y), @intCast(state.cursor_x));
+            try builder.cursorPos(@intCast(pty_instance.id), @intCast(state.cursor_y), @intCast(state.cursor_x));
+
+            // Send cursor shape
+            try builder.cursorShape(@intCast(pty_instance.id), state.cursor_shape);
 
             // Flush
             try builder.flush();

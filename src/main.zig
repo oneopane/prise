@@ -162,4 +162,5 @@ test {
     _ = @import("rpc.zig");
     _ = @import("pty.zig");
     _ = @import("client.zig");
+    _ = @import("redraw.zig");
 }

@@ -55,4 +55,15 @@ pub fn build(b: *std.Build) void {
     const test_cmd = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&test_cmd.step);
+
+    const fmt_step = b.step("fmt", "Format Zig and Lua files");
+
+    const fmt_zig = b.addFmt(.{
+        .paths = &.{ "src", "build.zig" },
+        .check = false,
+    });
+    fmt_step.dependOn(&fmt_zig.step);
+
+    const stylua = b.addSystemCommand(&.{ "stylua", "src/lua" });
+    fmt_step.dependOn(&stylua.step);
 }

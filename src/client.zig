@@ -6,6 +6,9 @@ const redraw = @import("redraw.zig");
 const posix = std.posix;
 const vaxis = @import("vaxis");
 const Surface = @import("Surface.zig");
+const UI = @import("ui.zig").UI;
+const lua_event = @import("lua_event.zig");
+const widget = @import("widget.zig");
 
 pub const MsgId = enum(u16) {
     spawn_pty = 1,
@@ -398,6 +401,7 @@ pub const App = struct {
     tty_buffer: [4096]u8 = undefined,
     surface: ?Surface = null,
     state: ClientState = ClientState.init(),
+    ui: UI = undefined,
 
     pipe_read_fd: posix.fd_t = undefined,
     pipe_write_fd: posix.fd_t = undefined,
@@ -419,6 +423,10 @@ pub const App = struct {
         try app.loop.init();
         std.log.info("Vaxis loop initialized", .{});
 
+        // Initialize Lua UI
+        app.ui = try UI.init(allocator);
+        std.log.info("Lua UI initialized", .{});
+
         // Create pipe for TTY thread -> Main thread communication
         const fds = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
         app.pipe_read_fd = fds[0];
@@ -429,6 +437,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        self.ui.deinit();
         self.state.should_quit = true;
 
         std.log.debug("deinit: recv_task={} io_loop={}", .{ self.recv_task != null, self.io_loop != null });
@@ -722,10 +731,34 @@ pub const App = struct {
 
     pub fn render(self: *App) !void {
         std.log.debug("render: starting render", .{});
-        if (self.surface) |*surface| {
-            const win = self.vx.window();
-            surface.render(win);
+
+        const root_widget = self.ui.view() catch |err| {
+            std.log.err("Failed to get view from UI: {}", .{err});
+            return;
+        };
+
+        const win = self.vx.window();
+        const screen = win.screen;
+
+        const constraints = widget.BoxConstraints{
+            .min_width = 0,
+            .max_width = screen.width,
+            .min_height = 0,
+            .max_height = screen.height,
+        };
+
+        var w = root_widget;
+        _ = w.layout(constraints);
+
+        switch (w.kind) {
+            .surface => |surf| {
+                if (self.surface) |*surface| {
+                    _ = surf;
+                    surface.render(win);
+                }
+            },
         }
+
         std.log.debug("render: calling vx.render()", .{});
         try self.vx.render(self.tty.writer());
         std.log.debug("render: flushing tty", .{});
@@ -840,10 +873,15 @@ pub const App = struct {
                         },
                         .attached => {
                             std.log.info("Attached to session, checking for resize", .{});
-                            if (app.surface) |*surface| {
-                                std.log.info("Sending initial resize: {}x{}", .{ surface.rows, surface.cols });
-                                // Send resize_pty
-                                if (app.state.pty_id) |pty_id| {
+
+                            if (app.state.pty_id) |pty_id| {
+                                // Send pty_attach event to Lua UI
+                                app.ui.update(.{ .pty_attach = @intCast(pty_id) }) catch |err| {
+                                    std.log.err("Failed to update UI with pty_attach: {}", .{err});
+                                };
+
+                                if (app.surface) |*surface| {
+                                    std.log.info("Sending initial resize: {}x{}", .{ surface.rows, surface.cols });
                                     const resize_msg = try msgpack.encode(app.allocator, .{
                                         2, // notification
                                         "resize_pty",

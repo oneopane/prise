@@ -8,7 +8,13 @@ local state = {
 local M = {}
 
 function M.update(event)
-    if event.type == "pty_attach" then
+    if event.type == "init" then
+        prise.spawn({
+            rows = 24,
+            cols = 80,
+            attach = true,
+        })
+    elseif event.type == "pty_attach" then
         state.pty = event.data.pty
     elseif event.type == "key_press" then
         if event.key == "b" and event.ctrl then

@@ -142,6 +142,13 @@ fn encodeValue(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) En
                 @compileError("Struct encoding not yet supported");
             }
         },
+        .@"union" => {
+            if (T == Value) {
+                try encodeValueType(allocator, buf, value);
+            } else {
+                @compileError("Unsupported union type: " ++ @typeName(T));
+            }
+        },
         else => @compileError("Unsupported type: " ++ @typeName(T)),
     }
 }

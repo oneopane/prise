@@ -12,12 +12,17 @@ pub const Event = union(enum) {
         app: *anyopaque,
         send_fn: *const fn (app: *anyopaque, data: []const u8) anyerror!void,
     },
+    init: void,
 };
 
 pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
     lua.createTable(0, 2);
 
     switch (event) {
+        .init => {
+            _ = lua.pushString("init");
+            lua.setField(-2, "type");
+        },
         .pty_attach => |info| {
             _ = lua.pushString("pty_attach");
             lua.setField(-2, "type");

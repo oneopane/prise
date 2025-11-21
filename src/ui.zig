@@ -20,6 +20,14 @@ pub const UI = struct {
     loop: ?*io.Loop = null,
     quit_callback: ?*const fn (ctx: *anyopaque) void = null,
     quit_ctx: *anyopaque = undefined,
+    spawn_callback: ?*const fn (ctx: *anyopaque, opts: SpawnOptions) anyerror!void = null,
+    spawn_ctx: *anyopaque = undefined,
+
+    pub const SpawnOptions = struct {
+        rows: u16,
+        cols: u16,
+        attach: bool,
+    };
 
     pub fn init(allocator: std.mem.Allocator) !UI {
         const lua = try ziglua.Lua.init(allocator);
@@ -85,6 +93,11 @@ pub const UI = struct {
         self.quit_callback = cb;
     }
 
+    pub fn setSpawnCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, opts: SpawnOptions) anyerror!void) void {
+        self.spawn_ctx = ctx;
+        self.spawn_callback = cb;
+    }
+
     fn loadPriseModule(lua: *ziglua.Lua) i32 {
         lua.doString(prise_module) catch {
             lua.pushNil();
@@ -99,7 +112,51 @@ pub const UI = struct {
         lua.pushFunction(ziglua.wrap(quit));
         lua.setField(-2, "quit");
 
+        // Register spawn
+        lua.pushFunction(ziglua.wrap(spawn));
+        lua.setField(-2, "spawn");
+
         return 1;
+    }
+
+    fn spawn(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pushNil();
+            return 1;
+        };
+        lua.pop(1); // pop ui ptr
+
+        if (ui.spawn_callback) |cb| {
+            if (lua.typeOf(1) != .table) {
+                lua.raiseErrorStr("spawn options must be a table", .{});
+            }
+
+            var opts: SpawnOptions = .{
+                .rows = 24,
+                .cols = 80,
+                .attach = true,
+            };
+
+            _ = lua.getField(1, "rows");
+            if (lua.isInteger(-1)) opts.rows = @intCast(lua.toInteger(-1) catch 24);
+            lua.pop(1);
+
+            _ = lua.getField(1, "cols");
+            if (lua.isInteger(-1)) opts.cols = @intCast(lua.toInteger(-1) catch 80);
+            lua.pop(1);
+
+            _ = lua.getField(1, "attach");
+            if (lua.isBoolean(-1)) opts.attach = lua.toBoolean(-1);
+            lua.pop(1);
+
+            cb(ui.spawn_ctx, opts) catch |err| {
+                lua.raiseErrorStr("Failed to spawn: %s", .{@errorName(err).ptr});
+            };
+        } else {
+            lua.raiseErrorStr("Spawn callback not configured", .{});
+        }
+        return 0;
     }
 
     fn setTimeout(lua: *ziglua.Lua) i32 {

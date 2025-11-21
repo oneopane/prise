@@ -485,6 +485,14 @@ pub const App = struct {
         // Send terminal queries to detect capabilities
         try self.vx.queryTerminalSend(self.tty.writer());
 
+        // Register spawn callback
+        self.ui.setSpawnCallback(self, struct {
+            fn spawnCb(ctx: *anyopaque, opts: UI.SpawnOptions) !void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.spawnPty(opts);
+            }
+        }.spawnCb);
+
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
         try self.handleVaxisEvent(.{ .winsize = ws });
@@ -743,6 +751,10 @@ pub const App = struct {
             .cap_da1 => {
                 self.vx.queries_done.store(true, .unordered);
                 try self.vx.enableDetectedFeatures(self.tty.writer());
+                // Send init event
+                self.ui.update(.init) catch |err| {
+                    std.log.err("Failed to update UI with init: {}", .{err});
+                };
             },
             else => {},
         }
@@ -1096,6 +1108,25 @@ pub const App = struct {
             const n = try posix.write(self.fd, data[index..]);
             index += n;
         }
+    }
+
+    pub fn spawnPty(self: *App, opts: UI.SpawnOptions) !void {
+        const msgid = self.state.next_msgid;
+        self.state.next_msgid += 1;
+
+        // Manually construct map for spawn params
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
+        defer self.allocator.free(map_items);
+
+        map_items[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = opts.rows } };
+        map_items[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = opts.cols } };
+        map_items[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = opts.attach } };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "spawn_pty", params });
+        defer self.allocator.free(msg);
+
+        try self.sendDirect(msg);
     }
 };
 

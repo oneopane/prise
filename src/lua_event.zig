@@ -2,12 +2,15 @@ const std = @import("std");
 const ziglua = @import("zlua");
 const vaxis = @import("vaxis");
 const Surface = @import("Surface.zig");
+const msgpack = @import("msgpack.zig");
 
 pub const Event = union(enum) {
     vaxis: vaxis.Event,
     pty_attach: struct {
         id: u32,
         surface: *Surface,
+        app: *anyopaque,
+        send_fn: *const fn (app: *anyopaque, data: []const u8) anyerror!void,
     },
 };
 
@@ -31,6 +34,8 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
             pty.* = .{
                 .id = info.id,
                 .surface = info.surface,
+                .app = info.app,
+                .send_fn = info.send_fn,
             };
 
             _ = lua.getMetatableRegistry("PrisePty");
@@ -49,9 +54,10 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
                 lua.createTable(0, 5);
 
                 if (key.codepoint != 0) {
-                    var buf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(key.codepoint, &buf) catch 0;
+                    var buf: [5]u8 = undefined; // Increased size for null terminator
+                    const len = std.unicode.utf8Encode(key.codepoint, buf[0..4]) catch 0;
                     if (len > 0) {
+                        buf[len] = 0; // Manually add null terminator
                         _ = lua.pushString(buf[0..len :0]);
                         lua.setField(-2, "key");
                     }
@@ -100,6 +106,8 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
 const PtyHandle = struct {
     id: u32,
     surface: *Surface,
+    app: *anyopaque,
+    send_fn: *const fn (app: *anyopaque, data: []const u8) anyerror!void,
 };
 
 fn ptyIndex(lua: *ziglua.Lua) i32 {
@@ -126,6 +134,51 @@ fn ptyId(lua: *ziglua.Lua) i32 {
     const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
     lua.pushInteger(@intCast(pty.id));
     return 1;
+}
+
+pub fn luaToMsgpack(lua: *ziglua.Lua, index: i32, allocator: std.mem.Allocator) !msgpack.Value {
+    const type_ = lua.typeOf(index);
+    switch (type_) {
+        .nil => return .nil,
+        .boolean => return .{ .boolean = lua.toBoolean(index) },
+        .number => {
+            if (lua.isInteger(index)) {
+                return .{ .integer = try lua.toInteger(index) };
+            } else {
+                return .{ .float = try lua.toNumber(index) };
+            }
+        },
+        .string => return .{ .string = try allocator.dupe(u8, lua.toString(index) catch "") },
+        .table => {
+            const len = lua.rawLen(index);
+            if (len > 0) {
+                var arr = try allocator.alloc(msgpack.Value, len);
+                errdefer allocator.free(arr);
+                var i: usize = 0;
+                while (i < len) : (i += 1) {
+                    _ = lua.rawGetIndex(index, @intCast(i + 1));
+                    arr[i] = try luaToMsgpack(lua, -1, allocator);
+                    lua.pop(1);
+                }
+                return .{ .array = arr };
+            } else {
+                var map_items = std.ArrayList(msgpack.Value.KeyValue).empty;
+                errdefer map_items.deinit(allocator);
+
+                const table_idx = if (index < 0) index - 1 else index;
+
+                lua.pushNil();
+                while (lua.next(table_idx)) {
+                    const key = try luaToMsgpack(lua, -2, allocator);
+                    const value = try luaToMsgpack(lua, -1, allocator);
+                    try map_items.append(allocator, .{ .key = key, .value = value });
+                    lua.pop(1);
+                }
+                return .{ .map = try map_items.toOwnedSlice(allocator) };
+            }
+        },
+        else => return .nil,
+    }
 }
 
 pub fn getPtyId(lua: *ziglua.Lua, index: i32) !u32 {

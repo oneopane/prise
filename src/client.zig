@@ -451,6 +451,20 @@ pub const App = struct {
     pub fn setup(self: *App, loop: *io.Loop) !void {
         self.io_loop = loop;
         self.ui.setLoop(loop);
+        self.ui.setQuitCallback(self, struct {
+            fn quit(ctx: *anyopaque) void {
+                const app: *App = @ptrCast(@alignCast(ctx));
+                app.state.should_quit = true;
+                if (app.connected) {
+                    posix.close(app.fd);
+                    app.connected = false;
+                }
+                if (app.recv_task) |*task| {
+                    if (app.io_loop) |l| task.cancel(l) catch {};
+                    app.recv_task = null;
+                }
+            }
+        }.quit);
 
         try self.vx.enterAltScreen(self.tty.writer());
 
@@ -561,6 +575,15 @@ pub const App = struct {
 
     fn handleVaxisEvent(self: *App, event: vaxis.Event) !void {
         std.log.debug("handleVaxisEvent: {s}", .{@tagName(event)});
+
+        // Forward to Lua UI
+        self.ui.update(.{ .vaxis = event }) catch |err| {
+            // Ignore NoUpdateFunction, log others
+            if (err != error.NoUpdateFunction) {
+                std.log.err("Lua UI update failed: {}", .{err});
+            }
+        };
+
         switch (event) {
             .key_press => |key| {
                 // Check for a cursor position response for our explicit width query. This will
@@ -1012,7 +1035,17 @@ pub const App = struct {
 
                                 if (app.surface) |*surface| {
                                     // Send pty_attach event to Lua UI
-                                    app.ui.update(.{ .pty_attach = .{ .id = @intCast(pty_id), .surface = surface } }) catch |err| {
+                                    app.ui.update(.{ .pty_attach = .{
+                                        .id = @intCast(pty_id),
+                                        .surface = surface,
+                                        .app = app,
+                                        .send_fn = struct {
+                                            fn appSendDirect(ctx: *anyopaque, data: []const u8) anyerror!void {
+                                                const self: *App = @ptrCast(@alignCast(ctx));
+                                                try self.sendDirect(data);
+                                            }
+                                        }.appSendDirect,
+                                    } }) catch |err| {
                                         std.log.err("Failed to update UI with pty_attach: {}", .{err});
                                     };
 

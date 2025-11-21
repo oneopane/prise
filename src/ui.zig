@@ -4,6 +4,7 @@ const vaxis = @import("vaxis");
 const widget = @import("widget.zig");
 const lua_event = @import("lua_event.zig");
 const io = @import("io.zig");
+const msgpack = @import("msgpack.zig");
 
 const prise_module = @embedFile("lua/prise.lua");
 const default_ui = @embedFile("lua/default.lua");
@@ -17,6 +18,8 @@ pub const UI = struct {
     allocator: std.mem.Allocator,
     lua: *ziglua.Lua,
     loop: ?*io.Loop = null,
+    quit_callback: ?*const fn (ctx: *anyopaque) void = null,
+    quit_ctx: *anyopaque = undefined,
 
     pub fn init(allocator: std.mem.Allocator) !UI {
         const lua = try ziglua.Lua.init(allocator);
@@ -77,6 +80,11 @@ pub const UI = struct {
         self.lua.setField(ziglua.registry_index, "prise_ui_ptr");
     }
 
+    pub fn setQuitCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
+        self.quit_ctx = ctx;
+        self.quit_callback = cb;
+    }
+
     fn loadPriseModule(lua: *ziglua.Lua) i32 {
         lua.doString(prise_module) catch {
             lua.pushNil();
@@ -86,6 +94,10 @@ pub const UI = struct {
         // Register set_timeout
         lua.pushFunction(ziglua.wrap(setTimeout));
         lua.setField(-2, "set_timeout");
+
+        // Register quit
+        lua.pushFunction(ziglua.wrap(quit));
+        lua.setField(-2, "quit");
 
         return 1;
     }
@@ -128,6 +140,20 @@ pub const UI = struct {
             lua.raiseErrorStr("Failed to schedule timeout", .{});
         };
 
+        return 0;
+    }
+
+    fn quit(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pushNil();
+            return 1;
+        };
+        lua.pop(1);
+
+        if (ui.quit_callback) |cb| {
+            cb(ui.quit_ctx);
+        }
         return 0;
     }
 

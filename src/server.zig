@@ -36,7 +36,7 @@ const Pty = struct {
     dirty_signal_buf: [1]u8 = undefined,
     last_render_time: i64 = 0,
     render_timer: ?io.Task = null,
-    last_viewport: ?ghostty_vt.Pin = null,
+    render_state: ghostty_vt.RenderState,
 
     // Pointer to server for callbacks (opaque to avoid circular type dependency)
     server_ptr: *anyopaque = undefined,
@@ -58,6 +58,7 @@ const Pty = struct {
             .title = std.ArrayList(u8).empty,
             .title_dirty = false,
             .pipe_fds = pipe_fds,
+            .render_state = .empty,
         };
         return instance;
     }
@@ -85,6 +86,7 @@ const Pty = struct {
         posix.close(self.pipe_fds[0]);
         posix.close(self.pipe_fds[1]);
         self.terminal.deinit(allocator);
+        self.render_state.deinit(allocator);
         self.clients.deinit(allocator);
         self.title.deinit(allocator);
         allocator.destroy(self);
@@ -292,15 +294,17 @@ const ScreenState = struct {
         allocator: std.mem.Allocator,
         pty_instance: *Pty,
         mode: RenderMode,
-        last_viewport: ?ghostty_vt.Pin,
     ) !ScreenState {
         const t0 = std.time.nanoTimestamp();
 
         pty_instance.terminal_mutex.lock();
-        errdefer pty_instance.terminal_mutex.unlock();
+        // Update RenderState using pty allocator (persistent)
+        try pty_instance.render_state.update(pty_instance.allocator, &pty_instance.terminal);
+        pty_instance.terminal_mutex.unlock();
 
-        // Snapshot the screen state so we can iterate without holding the lock
-        var screen = try pty_instance.terminal.screens.active.clone(allocator, .{ .viewport = .{} }, null);
+        const t1 = std.time.nanoTimestamp();
+
+        const rs = &pty_instance.render_state;
 
         // Copy title info
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -311,44 +315,13 @@ const ScreenState = struct {
         const title_changed = pty_instance.title_dirty;
         pty_instance.title_dirty = false;
 
-        const t1 = std.time.nanoTimestamp();
-
-        // Get current viewport pin from live terminal
-        // We expect this to always return a valid pin
-        const current_viewport = pty_instance.terminal.screens.active.pages.pin(.{ .viewport = .{} }).?;
-
-        // Determine effective mode based on dirty flags and viewport changes
+        // Determine effective mode based on dirty flags
         var effective_mode = mode;
+        if (rs.dirty == .full) effective_mode = .full;
+        rs.dirty = .false;
 
-        // Check terminal flags (palette, clear, etc)
-        if (!std.meta.eql(pty_instance.terminal.flags.dirty, .{})) effective_mode = .full;
-
-        // Check screen flags (selection, etc)
-        if (!std.meta.eql(pty_instance.terminal.screens.active.dirty, .{})) effective_mode = .full;
-
-        // Check if we scrolled (viewport changed)
-        if (last_viewport) |prev| {
-            if (!prev.eql(current_viewport)) effective_mode = .full;
-        } else {
-            effective_mode = .full;
-        }
-
-        // Clear all dirty flags
-        pty_instance.terminal.flags.dirty = .{};
-        pty_instance.terminal.screens.active.dirty = .{};
-        var it = pty_instance.terminal.screens.active.pages.pageIterator(.right_down, .{ .screen = .{} }, null);
-        while (it.next()) |chunk| {
-            var ds = chunk.node.data.dirtyBitSet();
-            ds.unsetAll();
-        }
-
-        pty_instance.terminal_mutex.unlock();
-
-        const t2 = std.time.nanoTimestamp();
-        defer screen.deinit();
-
-        const rows = screen.pages.rows;
-        const cols = screen.pages.cols;
+        const rows = rs.rows;
+        const cols = rs.cols;
 
         var styles_list = std.ArrayList(redraw.UIEvent.Style).empty;
         // no errdefer needed as arena handles cleanup
@@ -359,13 +332,13 @@ const ScreenState = struct {
 
         // Ensure default style is ID 0
         const StyleKey = struct { style: ghostty_vt.Style, selected: bool };
-        const default_style = ghostty_vt.Style{
+        const default_style: ghostty_vt.Style = .{
             .fg_color = .none,
             .bg_color = .none,
             .underline_color = .none,
             .flags = .{},
         };
-        const default_key = StyleKey{ .style = default_style, .selected = false };
+        const default_key: StyleKey = .{ .style = default_style, .selected = false };
         const default_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&default_key));
         try styles_map.put(default_hash, 0);
         try styles_list.append(arena_allocator, .{ .id = 0, .attrs = .{} });
@@ -375,41 +348,41 @@ const ScreenState = struct {
         // no errdefer needed as arena handles cleanup
 
         var utf8_buf: [4]u8 = undefined;
-        var grapheme_buf: [32]u21 = undefined;
-
-        var time_style_ops: i128 = 0;
-        var time_text_ops: i128 = 0;
+        var one_grapheme_buf: [1]u21 = undefined;
 
         var last_style_key: ?StyleKey = null;
         var last_style_id: u32 = 0;
 
-        // Iterate over the viewport
-        var row_it = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
-        var y: usize = 0;
+        // Iterate over the RenderState
+        const row_data_slice = rs.row_data.slice();
+        const row_cells = row_data_slice.items(.cells);
+        const row_dirties = row_data_slice.items(.dirty);
+        const row_selections = row_data_slice.items(.selection);
+
         var dirty_row_count: usize = 0;
 
-        while (row_it.next()) |row| : (y += 1) {
-            // If our viewport is smaller than the pages rows (can happen?), stop.
-            if (y >= rows) break;
-
+        for (0..rows) |y| {
             // If incremental, skip non-dirty rows
-            if (effective_mode == .incremental and !row.isDirty()) continue;
+            if (effective_mode == .incremental and !row_dirties[y]) continue;
             dirty_row_count += 1;
+            row_dirties[y] = false;
 
             var cells = try arena_allocator.alloc(CellData, cols);
             // no errdefer needed as arena handles cleanup
 
-            const row_cells = row.cells(.all);
-            // If row_cells is smaller than cols, we pad with empty cells?
-            // Ghostty's row.cells(.all) should return the full width generally,
-            // but let's be safe and iterate up to cols.
+            const rs_cells = row_cells[y];
+            const rs_cells_slice = rs_cells.slice();
+            const rs_cells_raw = rs_cells_slice.items(.raw);
+            const rs_cells_style = rs_cells_slice.items(.style);
+            const rs_cells_grapheme = rs_cells_slice.items(.grapheme);
+
+            const selection_range = row_selections[y];
 
             for (0..cols) |x| {
-                // Default cell if out of bounds
-                const cell = if (x < row_cells.len) &row_cells[x] else &ghostty_vt.Cell.init(0);
+                const raw_cell = rs_cells_raw[x];
 
                 // Skip spacer tails
-                if (cell.wide == .spacer_tail) {
+                if (raw_cell.wide == .spacer_tail) {
                     cells[x] = .{
                         .text = try arena_allocator.dupe(u8, ""),
                         .style_id = 0,
@@ -418,32 +391,30 @@ const ScreenState = struct {
                     continue;
                 }
 
-                // Check selection
-                const selected = if (screen.selection) |sel|
-                    sel.contains(&screen, .{ .node = row.node, .y = row.y, .x = @intCast(x) })
+                // Check selection (inclusive range)
+                const selected = if (selection_range) |range|
+                    x >= range[0] and x <= range[1]
                 else
                     false;
 
-                const ts0 = std.time.nanoTimestamp();
-
                 // Get ghostty style for this cell
-                var vt_style = row.style(cell);
+                var vt_style = if (raw_cell.style_id > 0) rs_cells_style[x] else default_style;
 
                 // Handle direct color cells (bg_color_rgb / bg_color_palette)
                 var text: []const u8 = "";
                 var is_direct_color = false;
 
-                if (cell.content_tag == .bg_color_rgb) {
-                    const cell_rgb = cell.content.color_rgb;
+                if (raw_cell.content_tag == .bg_color_rgb) {
+                    const cell_rgb = raw_cell.content.color_rgb;
                     vt_style.bg_color = .{ .rgb = .{ .r = cell_rgb.r, .g = cell_rgb.g, .b = cell_rgb.b } };
                     is_direct_color = true;
-                } else if (cell.content_tag == .bg_color_palette) {
-                    vt_style.bg_color = .{ .palette = cell.content.color_palette };
+                } else if (raw_cell.content_tag == .bg_color_palette) {
+                    vt_style.bg_color = .{ .palette = raw_cell.content.color_palette };
                     is_direct_color = true;
                 }
 
                 // Hash the style + selected flag together
-                const style_key = StyleKey{ .style = vt_style, .selected = selected };
+                const style_key: StyleKey = .{ .style = vt_style, .selected = selected };
 
                 // Optimization: check if it's the same as the last one
                 var style_id: u32 = 0;
@@ -459,11 +430,6 @@ const ScreenState = struct {
                 }
 
                 if (!found_match) {
-                    // Not cached or cached as 0 (which is default, so we still need to verify if it's truly default or new)
-                    // Actually if it was cached as 0, and matched, we would have broken out above.
-                    // But wait, initial last_style_id is 0.
-                    // Let's just do standard hash lookup if we didn't match last_style_key.
-
                     const style_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&style_key));
 
                     // Get or create style ID using style hash as key
@@ -483,34 +449,20 @@ const ScreenState = struct {
                     last_style_id = style_id;
                 }
 
-                const ts1 = std.time.nanoTimestamp();
-                time_style_ops += ts1 - ts0;
-
-                const tt0 = std.time.nanoTimestamp();
-
                 if (is_direct_color) {
                     text = try arena_allocator.dupe(u8, " ");
                 } else {
                     var cluster: []const u21 = &[_]u21{};
 
-                    switch (cell.content_tag) {
+                    switch (raw_cell.content_tag) {
                         .codepoint => {
-                            if (cell.content.codepoint != 0) {
-                                cluster = grapheme_buf[0..1];
-                                grapheme_buf[0] = cell.content.codepoint;
+                            if (raw_cell.content.codepoint != 0) {
+                                one_grapheme_buf[0] = raw_cell.content.codepoint;
+                                cluster = &one_grapheme_buf;
                             }
                         },
                         .codepoint_grapheme => {
-                            grapheme_buf[0] = cell.content.codepoint;
-                            var len: usize = 1;
-                            if (row.node.data.lookupGrapheme(cell)) |extra| {
-                                for (extra) |cp| {
-                                    if (len >= grapheme_buf.len) break;
-                                    grapheme_buf[len] = cp;
-                                    len += 1;
-                                }
-                            }
-                            cluster = grapheme_buf[0..len];
+                            cluster = rs_cells_grapheme[x];
                         },
                         else => {
                             cluster = &[_]u21{' '};
@@ -530,45 +482,37 @@ const ScreenState = struct {
                     }
                 }
 
-                const tt1 = std.time.nanoTimestamp();
-                time_text_ops += tt1 - tt0;
-
                 cells[x] = .{
                     .text = text,
                     .style_id = style_id,
-                    .wide = cell.wide == .wide,
+                    .wide = raw_cell.wide == .wide,
                 };
             }
 
             try rows_data.append(arena_allocator, .{ .y = y, .cells = cells });
         }
 
-        const t3 = std.time.nanoTimestamp();
+        const t2 = std.time.nanoTimestamp();
 
-        const cursor_shape: redraw.UIEvent.CursorShape.Shape = switch (screen.cursor.cursor_style) {
-            .block, .block_hollow => .block,
-            .bar => .beam,
-            .underline => .underline,
-        };
+        const update_us = @divTrunc(t1 - t0, std.time.ns_per_us);
+        const build_us = @divTrunc(t2 - t1, std.time.ns_per_us);
 
-        const clone_us = @divTrunc(t1 - t0, std.time.ns_per_us);
-        const clear_us = @divTrunc(t2 - t1, std.time.ns_per_us);
-        const iterate_us = @divTrunc(t3 - t2, std.time.ns_per_us);
-        const style_us = @divTrunc(time_style_ops, std.time.ns_per_us);
-        const text_us = @divTrunc(time_text_ops, std.time.ns_per_us);
+        std.log.info("ScreenState.init: mode={s} dirty_rows={}/{} update={}us build={}us", .{ if (effective_mode == .full) "full" else "incremental", dirty_row_count, rows, update_us, build_us });
 
-        std.log.info("ScreenState.init: mode={s} dirty_rows={}/{} clone={}us clear={}us iterate={}us (style={}us text={}us)", .{ if (effective_mode == .full) "full" else "incremental", dirty_row_count, rows, clone_us, clear_us, iterate_us, style_us, text_us });
-
-        return .{
-            .rows = rows,
-            .cols = cols,
-            .cursor_x = screen.cursor.x,
-            .cursor_y = screen.cursor.y,
-            .cursor_visible = pty_instance.terminal.modes.get(.cursor_visible),
-            .cursor_shape = cursor_shape,
+        return ScreenState{
+            .rows = @intCast(rows),
+            .cols = @intCast(cols),
+            .cursor_x = @intCast(rs.cursor.active.x),
+            .cursor_y = @intCast(rs.cursor.active.y),
+            .cursor_visible = rs.cursor.visible,
+            .cursor_shape = switch (rs.cursor.visual_style) {
+                .block, .block_hollow => .block,
+                .bar => .beam,
+                .underline => .underline,
+            },
             .rows_data = try rows_data.toOwnedSlice(arena_allocator),
             .styles = try styles_list.toOwnedSlice(arena_allocator),
-            .viewport = current_viewport,
+            .viewport = rs.viewport_pin.?,
             .arena = arena,
             .title = title,
             .title_changed = title_changed,
@@ -1082,7 +1026,7 @@ const Server = struct {
 
                 // Send initial redraw
                 std.log.info("Sending initial redraw for session {}", .{session_id});
-                var state = try ScreenState.init(self.allocator, pty_instance, .full, pty_instance.last_viewport);
+                var state = try ScreenState.init(self.allocator, pty_instance, .full);
                 defer state.deinit();
                 std.log.info("ScreenState: rows={} cols={}", .{ state.rows, state.cols });
                 try self.sendRedraw(self.loop, pty_instance, &state, client, .full);
@@ -1114,7 +1058,6 @@ const Server = struct {
                 self.allocator,
                 pty_instance,
                 .full,
-                null,
             );
             defer state.deinit();
 
@@ -1464,7 +1407,6 @@ const Server = struct {
             self.allocator,
             pty_instance,
             .incremental,
-            pty_instance.last_viewport,
         ) catch |err| {
             std.log.err("Failed to copy screen state for session {}: {}", .{ pty_instance.id, err });
             return;
@@ -1475,9 +1417,6 @@ const Server = struct {
 
         // Determine mode from state (ScreenState.init can change mode from incremental to full)
         const mode_str = if (state.rows_data.len == state.rows) "full" else "incremental";
-
-        // Update total rows
-        pty_instance.last_viewport = state.viewport;
 
         // Build and send redraw notifications
         self.sendRedraw(self.loop, pty_instance, &state, null, .incremental) catch |err| {
@@ -2033,12 +1972,23 @@ test "ScreenState style optimization" {
     const allocator = testing.allocator;
 
     var pty_inst: Pty = undefined;
-    pty_inst.terminal = try ghostty_vt.Terminal.init(allocator, .{ .cols = 10, .rows = 2 });
+    // Initialize with safe defaults for the fields we don't care about in this test
+    pty_inst = .{
+        .id = 0,
+        .process = .{ .master = -1, .slave = -1, .pid = 0 },
+        .clients = undefined, // Not used
+        .running = undefined, // Not used
+        .terminal = try ghostty_vt.Terminal.init(allocator, .{ .cols = 10, .rows = 2 }),
+        .allocator = allocator,
+        .title = std.ArrayList(u8).empty,
+        .title_dirty = false,
+        .pipe_fds = undefined, // Not used
+        .render_state = .empty,
+        .server_ptr = undefined, // Not used
+    };
     defer pty_inst.terminal.deinit(allocator);
-    pty_inst.terminal_mutex = std.Thread.Mutex{};
-    pty_inst.title = std.ArrayList(u8).empty;
+    defer pty_inst.render_state.deinit(allocator);
     defer pty_inst.title.deinit(allocator);
-    pty_inst.title_dirty = false;
 
     const handler = vt_handler.Handler.init(&pty_inst.terminal);
     var stream = vt_handler.Stream.initAlloc(allocator, handler);
@@ -2062,7 +2012,7 @@ test "ScreenState style optimization" {
     try stream.nextSlice("\x1b[31m");
     try stream.nextSlice(&[_]u8{'D'});
 
-    var state = try ScreenState.init(allocator, &pty_inst, .full, null);
+    var state = try ScreenState.init(allocator, &pty_inst, .full);
     defer state.deinit();
 
     // Find row 0 and 1
@@ -2129,6 +2079,7 @@ test "server - pty exit notification" {
             posix.close(p.*.pipe_fds[0]);
             posix.close(p.*.pipe_fds[1]);
             p.*.terminal.deinit(allocator);
+            p.*.render_state.deinit(allocator);
             p.*.clients.deinit(allocator);
             p.*.title.deinit(allocator);
             allocator.destroy(p.*);
@@ -2159,6 +2110,7 @@ test "server - pty exit notification" {
         .title = std.ArrayList(u8).empty,
         .title_dirty = false,
         .pipe_fds = pipe_fds,
+        .render_state = .empty,
         .server_ptr = &server,
         .exited = std.atomic.Value(bool).init(false),
         .exit_status = std.atomic.Value(u32).init(0),

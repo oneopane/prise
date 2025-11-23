@@ -11,6 +11,13 @@ const ghostty_vt = @import("ghostty-vt");
 const vt_handler = @import("vt_handler.zig");
 const redraw = @import("redraw.zig");
 
+var signal_write_fd: posix.fd_t = undefined;
+
+fn signalHandler(sig: c_int) callconv(std.builtin.CallingConvention.c) void {
+    _ = sig;
+    _ = posix.write(signal_write_fd, "s") catch {};
+}
+
 const Pty = struct {
     id: usize,
     process: pty.Process,
@@ -287,269 +294,260 @@ fn getStyleAttributes(style: ghostty_vt.Style, selected: bool) redraw.UIEvent.St
 }
 
 /// Captured screen state for building redraw notifications
-const ScreenState = struct {
-    rows: usize,
-    cols: usize,
-    cursor_x: usize,
-    cursor_y: usize,
-    cursor_visible: bool,
-    cursor_shape: redraw.UIEvent.CursorShape.Shape,
-    rows_data: []DirtyRow,
-    styles: []const redraw.UIEvent.Style,
-    viewport: ghostty_vt.Pin,
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    title_changed: bool,
+pub const RenderMode = enum { full, incremental };
 
-    pub const RenderMode = enum { full, incremental };
+/// Build redraw message directly from PTY render state
+fn buildRedrawMessageFromPty(
+    allocator: std.mem.Allocator,
+    pty_instance: *Pty,
+    mode: RenderMode,
+) ![]u8 {
+    var builder = redraw.RedrawBuilder.init(allocator);
+    defer builder.deinit();
 
-    pub const DirtyRow = struct {
-        y: usize,
-        cells: []CellData,
-    };
+    // Temporary arena for this build operation (text buffers, style map, etc)
+    var temp_arena = std.heap.ArenaAllocator.init(allocator);
+    defer temp_arena.deinit();
+    const temp_alloc = temp_arena.allocator();
 
-    const CellData = struct {
-        text: []const u8, // UTF-8 encoded
-        style_id: u32,
-        wide: bool, // true if this cell is wide (occupies 2 columns)
-    };
+    pty_instance.terminal_mutex.lock();
+    try pty_instance.render_state.update(pty_instance.allocator, &pty_instance.terminal);
+    pty_instance.terminal_mutex.unlock();
 
-    fn init(
-        allocator: std.mem.Allocator,
-        pty_instance: *Pty,
-        mode: RenderMode,
-    ) !ScreenState {
-        const t0 = std.time.nanoTimestamp();
+    const rs = &pty_instance.render_state;
 
-        pty_instance.terminal_mutex.lock();
-        // Update RenderState using pty allocator (persistent)
-        try pty_instance.render_state.update(pty_instance.allocator, &pty_instance.terminal);
-        pty_instance.terminal_mutex.unlock();
-
-        const t1 = std.time.nanoTimestamp();
-
-        const rs = &pty_instance.render_state;
-
-        // Copy title info
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const arena_allocator = arena.allocator();
-
-        const title = try arena_allocator.dupe(u8, pty_instance.title.items);
-        const title_changed = pty_instance.title_dirty;
+    // Handle title
+    if (mode == .full or pty_instance.title_dirty) {
+        try builder.title(@intCast(pty_instance.id), pty_instance.title.items);
         pty_instance.title_dirty = false;
+    }
 
-        // Determine effective mode based on dirty flags
-        var effective_mode = mode;
-        const rs_was_full = (rs.dirty == .full);
-        if (rs_was_full) effective_mode = .full;
-        rs.dirty = .false;
+    var effective_mode = mode;
+    if (rs.dirty == .full) effective_mode = .full;
+    rs.dirty = .false;
 
-        const rows = rs.rows;
-        const cols = rs.cols;
+    const rows = rs.rows;
+    const cols = rs.cols;
 
-        var styles_list = std.ArrayList(redraw.UIEvent.Style).empty;
-        // no errdefer needed as arena handles cleanup
+    if (effective_mode == .full) {
+        try builder.resize(@intCast(pty_instance.id), @intCast(rows), @intCast(cols));
+    }
 
-        // Map from style hash to our style ID for deduplication within this frame
-        var styles_map = std.AutoHashMap(u64, u32).init(arena_allocator);
-        // no defer needed as arena handles cleanup
+    // Style deduplication
+    var styles_map = std.AutoHashMap(u64, u32).init(temp_alloc);
+    var next_style_id: u32 = 1;
 
-        // Ensure default style is ID 0
-        const StyleKey = struct { style: ghostty_vt.Style, selected: bool };
-        const default_style: ghostty_vt.Style = .{
-            .fg_color = .none,
-            .bg_color = .none,
-            .underline_color = .none,
-            .flags = .{},
-        };
-        const default_key: StyleKey = .{ .style = default_style, .selected = false };
-        const default_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&default_key));
-        try styles_map.put(default_hash, 0);
-        try styles_list.append(arena_allocator, .{ .id = 0, .attrs = .{} });
-        var next_style_id: u32 = 1;
+    const StyleKey = struct { style: ghostty_vt.Style, selected: bool };
+    const default_style: ghostty_vt.Style = .{
+        .fg_color = .none,
+        .bg_color = .none,
+        .underline_color = .none,
+        .flags = .{},
+    };
+    const default_key: StyleKey = .{ .style = default_style, .selected = false };
+    const default_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&default_key));
+    try styles_map.put(default_hash, 0);
+    try builder.style(0, .{}); // Ensure default style is known
 
-        var rows_data = std.ArrayList(DirtyRow).empty;
-        // no errdefer needed as arena handles cleanup
+    // Iteration buffers
+    const row_data_slice = rs.row_data.slice();
+    const row_cells = row_data_slice.items(.cells);
+    const row_dirties = row_data_slice.items(.dirty);
+    const row_selections = row_data_slice.items(.selection);
 
-        var utf8_buf: [4]u8 = undefined;
-        var one_grapheme_buf: [1]u21 = undefined;
+    var last_style_key: ?StyleKey = null;
+    var last_style_id: u32 = 0;
 
-        var last_style_key: ?StyleKey = null;
-        var last_style_id: u32 = 0;
+    // Reused buffers for text encoding
+    var utf8_buf: [4]u8 = undefined;
+    var one_grapheme_buf: [1]u21 = undefined;
 
-        // Iterate over the RenderState
-        const row_data_slice = rs.row_data.slice();
-        const row_cells = row_data_slice.items(.cells);
-        const row_dirties = row_data_slice.items(.dirty);
-        const row_selections = row_data_slice.items(.selection);
+    for (0..rows) |y| {
+        if (effective_mode == .incremental and !row_dirties[y]) continue;
+        row_dirties[y] = false;
 
-        var dirty_row_count: usize = 0;
+        var cells_buf = std.ArrayList(redraw.UIEvent.Write.Cell).empty;
 
-        for (0..rows) |y| {
-            // If incremental, skip non-dirty rows
-            if (effective_mode == .incremental and !row_dirties[y]) continue;
-            dirty_row_count += 1;
-            row_dirties[y] = false;
+        const rs_cells = row_cells[y];
+        const rs_cells_slice = rs_cells.slice();
+        const rs_cells_raw = rs_cells_slice.items(.raw);
+        const rs_cells_style = rs_cells_slice.items(.style);
+        const rs_cells_grapheme = rs_cells_slice.items(.grapheme);
+        const selection_range = row_selections[y];
 
-            var cells = try arena_allocator.alloc(CellData, cols);
-            // no errdefer needed as arena handles cleanup
+        var last_hl_id: u32 = 0;
 
-            const rs_cells = row_cells[y];
-            const rs_cells_slice = rs_cells.slice();
-            const rs_cells_raw = rs_cells_slice.items(.raw);
-            const rs_cells_style = rs_cells_slice.items(.style);
-            const rs_cells_grapheme = rs_cells_slice.items(.grapheme);
+        var x: usize = 0;
+        while (x < cols) {
+            const raw_cell = rs_cells_raw[x];
 
-            const selection_range = row_selections[y];
-
-            for (0..cols) |x| {
-                const raw_cell = rs_cells_raw[x];
-
-                // Skip spacer tails
-                if (raw_cell.wide == .spacer_tail) {
-                    cells[x] = .{
-                        .text = try arena_allocator.dupe(u8, ""),
-                        .style_id = 0,
-                        .wide = false,
-                    };
-                    continue;
-                }
-
-                // Check selection (inclusive range)
-                const selected = if (selection_range) |range|
-                    x >= range[0] and x <= range[1]
-                else
-                    false;
-
-                // Get ghostty style for this cell
-                var vt_style = if (raw_cell.style_id > 0) rs_cells_style[x] else default_style;
-
-                // Handle direct color cells (bg_color_rgb / bg_color_palette)
-                var text: []const u8 = "";
-                var is_direct_color = false;
-
-                if (raw_cell.content_tag == .bg_color_rgb) {
-                    const cell_rgb = raw_cell.content.color_rgb;
-                    vt_style.bg_color = .{ .rgb = .{ .r = cell_rgb.r, .g = cell_rgb.g, .b = cell_rgb.b } };
-                    is_direct_color = true;
-                } else if (raw_cell.content_tag == .bg_color_palette) {
-                    vt_style.bg_color = .{ .palette = raw_cell.content.color_palette };
-                    is_direct_color = true;
-                }
-
-                // Hash the style + selected flag together
-                const style_key: StyleKey = .{ .style = vt_style, .selected = selected };
-
-                // Optimization: check if it's the same as the last one
-                var style_id: u32 = 0;
-                var found_match = false;
-
-                if (last_style_key) |last| {
-                    // Manual equality check for StyleKey since it has padding
-                    const style_eq = std.meta.eql(last.style, style_key.style);
-                    if (style_eq and last.selected == style_key.selected) {
-                        style_id = last_style_id;
-                        found_match = true;
-                    }
-                }
-
-                if (!found_match) {
-                    const style_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&style_key));
-
-                    // Get or create style ID using style hash as key
-                    style_id = if (styles_map.get(style_hash)) |id|
-                        id
-                    else id: {
-                        const id = next_style_id;
-                        next_style_id += 1;
-                        const attrs = getStyleAttributes(vt_style, selected);
-                        try styles_map.put(style_hash, id);
-                        try styles_list.append(arena_allocator, .{ .id = id, .attrs = attrs });
-                        break :id id;
-                    };
-
-                    // Update cache
-                    last_style_key = style_key;
-                    last_style_id = style_id;
-                }
-
-                if (is_direct_color) {
-                    text = try arena_allocator.dupe(u8, " ");
-                } else {
-                    var cluster: []const u21 = &[_]u21{};
-
-                    switch (raw_cell.content_tag) {
-                        .codepoint => {
-                            if (raw_cell.content.codepoint != 0) {
-                                one_grapheme_buf[0] = raw_cell.content.codepoint;
-                                cluster = &one_grapheme_buf;
-                            }
-                        },
-                        .codepoint_grapheme => {
-                            cluster = rs_cells_grapheme[x];
-                        },
-                        else => {
-                            cluster = &[_]u21{' '};
-                        },
-                    }
-
-                    if (cluster.len > 0) {
-                        var stack_buf: [64]u8 = undefined;
-                        var stack_len: usize = 0;
-                        for (cluster) |cp| {
-                            if (stack_len + 4 > stack_buf.len) break;
-                            const len = std.unicode.utf8Encode(cp, &utf8_buf) catch continue;
-                            @memcpy(stack_buf[stack_len..][0..len], utf8_buf[0..len]);
-                            stack_len += len;
-                        }
-                        text = try arena_allocator.dupe(u8, stack_buf[0..stack_len]);
-                    } else {
-                        text = try arena_allocator.dupe(u8, " ");
-                    }
-                }
-
-                cells[x] = .{
-                    .text = text,
-                    .style_id = style_id,
-                    .wide = raw_cell.wide == .wide,
-                };
+            if (raw_cell.wide == .spacer_tail) {
+                x += 1;
+                continue;
             }
 
-            try rows_data.append(arena_allocator, .{ .y = y, .cells = cells });
+            // Determine selection
+            const selected = if (selection_range) |range|
+                x >= range[0] and x <= range[1]
+            else
+                false;
+
+            // Resolve style
+            var vt_style = if (raw_cell.style_id > 0) rs_cells_style[x] else default_style;
+            var is_direct_color = false;
+
+            if (raw_cell.content_tag == .bg_color_rgb) {
+                const cell_rgb = raw_cell.content.color_rgb;
+                vt_style.bg_color = .{ .rgb = .{ .r = cell_rgb.r, .g = cell_rgb.g, .b = cell_rgb.b } };
+                is_direct_color = true;
+            } else if (raw_cell.content_tag == .bg_color_palette) {
+                vt_style.bg_color = .{ .palette = raw_cell.content.color_palette };
+                is_direct_color = true;
+            }
+
+            const style_key: StyleKey = .{ .style = vt_style, .selected = selected };
+            var style_id: u32 = 0;
+            var found_match = false;
+
+            if (last_style_key) |last| {
+                const style_eq = std.meta.eql(last.style, style_key.style);
+                if (style_eq and last.selected == style_key.selected) {
+                    style_id = last_style_id;
+                    found_match = true;
+                }
+            }
+
+            if (!found_match) {
+                const style_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&style_key));
+                if (styles_map.get(style_hash)) |id| {
+                    style_id = id;
+                } else {
+                    style_id = next_style_id;
+                    next_style_id += 1;
+                    try styles_map.put(style_hash, style_id);
+                    const attrs = getStyleAttributes(vt_style, selected);
+                    try builder.style(style_id, attrs);
+                }
+                last_style_key = style_key;
+                last_style_id = style_id;
+            }
+
+            // Resolve text
+            var text: []const u8 = "";
+            if (is_direct_color) {
+                text = " ";
+            } else {
+                var cluster: []const u21 = &[_]u21{};
+                switch (raw_cell.content_tag) {
+                    .codepoint => {
+                        if (raw_cell.content.codepoint != 0) {
+                            one_grapheme_buf[0] = raw_cell.content.codepoint;
+                            cluster = &one_grapheme_buf;
+                        }
+                    },
+                    .codepoint_grapheme => {
+                        cluster = rs_cells_grapheme[x];
+                    },
+                    else => {
+                        cluster = &[_]u21{' '};
+                    },
+                }
+
+                if (cluster.len > 0) {
+                    // Encode to utf8
+                    var stack_buf: [64]u8 = undefined;
+                    var stack_len: usize = 0;
+                    for (cluster) |cp| {
+                        if (stack_len + 4 > stack_buf.len) break;
+                        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch continue;
+                        @memcpy(stack_buf[stack_len..][0..len], utf8_buf[0..len]);
+                        stack_len += len;
+                    }
+                    text = try temp_alloc.dupe(u8, stack_buf[0..stack_len]);
+                } else {
+                    text = try temp_alloc.dupe(u8, " ");
+                }
+            }
+
+            // Repeat detection
+            var repeat: usize = 1;
+            var next_x = x + 1;
+            if (raw_cell.wide == .wide) next_x += 1;
+
+            while (next_x < cols) {
+                if (next_x >= cols) break;
+                const next_raw = rs_cells_raw[next_x];
+
+                // Width mismatch
+                if (raw_cell.wide != next_raw.wide) break;
+
+                var next_text_match = false;
+
+                // For direct color, ensure tag matches and color matches
+                if (is_direct_color) {
+                    if (next_raw.content_tag == raw_cell.content_tag and next_raw.style_id == raw_cell.style_id) {
+                        const next_selected = if (selection_range) |range| next_x >= range[0] and next_x <= range[1] else false;
+                        if (next_selected == selected) {
+                            if (raw_cell.content_tag == .bg_color_rgb) {
+                                if (std.meta.eql(raw_cell.content.color_rgb, next_raw.content.color_rgb)) next_text_match = true;
+                            } else if (raw_cell.content_tag == .bg_color_palette) {
+                                if (raw_cell.content.color_palette == next_raw.content.color_palette) next_text_match = true;
+                            }
+                        }
+                    }
+                } else {
+                    // Normal text
+                    if (next_raw.content_tag == raw_cell.content_tag and next_raw.style_id == raw_cell.style_id) {
+                        const next_selected = if (selection_range) |range| next_x >= range[0] and next_x <= range[1] else false;
+                        if (next_selected == selected) {
+                            if (raw_cell.content_tag == .codepoint) {
+                                if (next_raw.content.codepoint == raw_cell.content.codepoint) next_text_match = true;
+                            } else if (raw_cell.content_tag == .codepoint_grapheme) {
+                                if (std.mem.eql(u21, rs_cells_grapheme[x], rs_cells_grapheme[next_x])) next_text_match = true;
+                            } else {
+                                next_text_match = true;
+                            }
+                        }
+                    }
+                }
+
+                if (!next_text_match) break;
+
+                repeat += 1;
+                next_x += 1;
+                if (next_raw.wide == .wide) next_x += 1;
+            }
+
+            const hl_id_to_send: ?u32 = if (style_id != last_hl_id) style_id else null;
+            if (hl_id_to_send) |id| last_hl_id = id;
+
+            try cells_buf.append(temp_alloc, .{
+                .grapheme = text,
+                .style_id = hl_id_to_send,
+                .repeat = if (repeat > 1) @intCast(repeat) else null,
+            });
+
+            x = next_x;
         }
 
-        const t2 = std.time.nanoTimestamp();
-
-        const update_us = @divTrunc(t1 - t0, std.time.ns_per_us);
-        const build_us = @divTrunc(t2 - t1, std.time.ns_per_us);
-
-        std.log.info("ScreenState.init: mode={s} rs_full={} dirty_rows={}/{} update={}us build={}us", .{ if (effective_mode == .full) "full" else "incremental", rs_was_full, dirty_row_count, rows, update_us, build_us });
-
-        return ScreenState{
-            .rows = @intCast(rows),
-            .cols = @intCast(cols),
-            .cursor_x = @intCast(rs.cursor.active.x),
-            .cursor_y = @intCast(rs.cursor.active.y),
-            .cursor_visible = rs.cursor.visible,
-            .cursor_shape = switch (rs.cursor.visual_style) {
-                .block, .block_hollow => .block,
-                .bar => .beam,
-                .underline => .underline,
-            },
-            .rows_data = try rows_data.toOwnedSlice(arena_allocator),
-            .styles = try styles_list.toOwnedSlice(arena_allocator),
-            .viewport = rs.viewport_pin.?,
-            .arena = arena,
-            .title = title,
-            .title_changed = title_changed,
-        };
+        if (cells_buf.items.len > 0) {
+            try builder.write(@intCast(pty_instance.id), @intCast(y), 0, cells_buf.items);
+        }
     }
 
-    fn deinit(self: *ScreenState) void {
-        self.arena.deinit();
+    if (rs.cursor.visible) {
+        try builder.cursorPos(@intCast(pty_instance.id), @intCast(rs.cursor.active.y), @intCast(rs.cursor.active.x));
     }
-};
+    const shape: redraw.UIEvent.CursorShape.Shape = switch (rs.cursor.visual_style) {
+        .block, .block_hollow => .block,
+        .bar => .beam,
+        .underline => .underline,
+    };
+    try builder.cursorShape(@intCast(pty_instance.id), shape);
+
+    try builder.flush();
+    return builder.build();
+}
 
 const Client = struct {
     fd: posix.fd_t,
@@ -904,6 +902,8 @@ const Server = struct {
     accepting: bool = true,
     accept_task: ?io.Task = null,
     exit_on_idle: bool = false,
+    signal_pipe_fds: [2]posix.fd_t,
+    signal_buf: [1]u8 = undefined,
 
     fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.winsize, attach: bool } {
         var rows: u16 = 24;
@@ -1053,10 +1053,9 @@ const Server = struct {
 
                 // Send initial redraw
                 std.log.info("Sending initial redraw for session {}", .{session_id});
-                var state = try ScreenState.init(self.allocator, pty_instance, .full);
-                defer state.deinit();
-                std.log.info("ScreenState: rows={} cols={}", .{ state.rows, state.cols });
-                try self.sendRedraw(self.loop, pty_instance, &state, client, .full);
+                const msg = try buildRedrawMessageFromPty(self.allocator, pty_instance, .full);
+                defer self.allocator.free(msg);
+                try self.sendRedraw(self.loop, pty_instance, msg, client);
             }
 
             std.log.info("Created session {} with PID {}", .{ session_id, process.pid });
@@ -1081,14 +1080,14 @@ const Server = struct {
             std.log.info("Client {} attached to session {}", .{ client.fd, session_id });
 
             // Send full redraw to the newly attached client
-            var state = try ScreenState.init(
+            const msg = try buildRedrawMessageFromPty(
                 self.allocator,
                 pty_instance,
                 .full,
             );
-            defer state.deinit();
+            defer self.allocator.free(msg);
 
-            try self.sendRedraw(self.loop, pty_instance, &state, client, .full);
+            try self.sendRedraw(self.loop, pty_instance, msg, client);
 
             return msgpack.Value{ .unsigned = session_id };
         } else if (std.mem.eql(u8, method, "write_pty")) {
@@ -1312,98 +1311,15 @@ const Server = struct {
         self.checkExit() catch {};
     }
 
-    /// Build and send redraw notification for a session to attached clients
-    fn buildRedrawMessage(allocator: std.mem.Allocator, pty_id: usize, state: *ScreenState, mode: ScreenState.RenderMode) ![]u8 {
-        var builder = redraw.RedrawBuilder.init(allocator);
-        defer builder.deinit();
-
-        if (mode == .full) {
-            try builder.resize(@intCast(pty_id), @intCast(state.rows), @intCast(state.cols));
-        }
-
-        if (mode == .full or state.title_changed) {
-            try builder.title(@intCast(pty_id), state.title);
-        }
-
-        // Define all styles used in this frame
-        for (state.styles) |style| {
-            try builder.style(style.id, style.attrs);
-        }
-
-        // Build write events for each dirty row
-        for (state.rows_data) |row| {
-            var cells_buf = std.ArrayList(redraw.UIEvent.Write.Cell).empty;
-            defer cells_buf.deinit(allocator);
-
-            // Track the last style ID sent to optimize output
-            var last_hl_id: u32 = 0;
-
-            var x: usize = 0;
-            while (x < state.cols) {
-                if (x >= row.cells.len) break;
-                const cell = &row.cells[x];
-
-                // Count consecutive cells with same style
-                var repeat: usize = 1;
-                var next_x = x + 1;
-                if (cell.wide) next_x += 1; // Skip spacer for wide char
-
-                while (next_x < state.cols and next_x < row.cells.len) {
-                    const next_cell = &row.cells[next_x];
-                    if (next_cell.style_id != cell.style_id) break;
-                    if (!std.mem.eql(u8, next_cell.text, cell.text)) break;
-
-                    repeat += 1;
-                    next_x += 1;
-                    if (next_cell.wide) next_x += 1;
-                }
-
-                // Determine if we need to send the style ID
-                const hl_id_to_send: ?u32 = if (cell.style_id != last_hl_id) cell.style_id else null;
-                if (hl_id_to_send) |id| {
-                    last_hl_id = id;
-                }
-
-                try cells_buf.append(allocator, .{
-                    .grapheme = cell.text,
-                    .style_id = hl_id_to_send,
-                    .repeat = if (repeat > 1) @intCast(repeat) else null,
-                });
-
-                x = next_x;
-            }
-
-            if (cells_buf.items.len > 0) {
-                try builder.write(@intCast(pty_id), @intCast(row.y), 0, cells_buf.items);
-            }
-        }
-
-        // Send cursor position
-        if (state.cursor_visible) {
-            try builder.cursorPos(@intCast(pty_id), @intCast(state.cursor_y), @intCast(state.cursor_x));
-        }
-
-        // Send cursor shape
-        try builder.cursorShape(@intCast(pty_id), state.cursor_shape);
-
-        try builder.flush();
-        return builder.build();
-    }
-
-    /// Build and send redraw notification for a session to attached clients
-    fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, state: *ScreenState, target_client: ?*Client, mode: ScreenState.RenderMode) !void {
-        std.log.debug("sendRedraw: session={} rows={} cols={} mode={} target_client={} total_clients={}", .{ pty_instance.id, state.rows, state.cols, mode, target_client != null, self.clients.items.len });
-
-        const msg = try buildRedrawMessage(self.allocator, pty_instance.id, state, mode);
-        defer self.allocator.free(msg);
+    /// Send redraw notification (bytes) to attached clients
+    fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, msg: []const u8, target_client: ?*Client) !void {
+        std.log.debug("sendRedraw: session={} bytes={} target_client={} total_clients={}", .{ pty_instance.id, msg.len, target_client != null, self.clients.items.len });
 
         // Send to each client attached to this session
         for (self.clients.items) |client| {
-            std.log.debug("sendRedraw: checking client fd={}", .{client.fd});
             // If we have a target client, skip others
             if (target_client) |target| {
                 if (client != target) {
-                    std.log.debug("sendRedraw: skipping client fd={} (not target)", .{client.fd});
                     continue;
                 }
             }
@@ -1416,12 +1332,10 @@ const Server = struct {
                     break;
                 }
             }
-            std.log.debug("sendRedraw: client fd={} attached={} attached_sessions={}", .{ client.fd, attached, client.attached_sessions.items.len });
             if (!attached) {
                 continue;
             }
 
-            std.log.debug("sendRedraw: sending {} bytes to client fd={}", .{ msg.len, client.fd });
             try client.sendData(loop, msg);
         }
     }
@@ -1429,33 +1343,28 @@ const Server = struct {
     fn renderFrame(self: *Server, pty_instance: *Pty) void {
         const start_time = std.time.nanoTimestamp();
 
-        // Copy screen state under mutex
-        var state = ScreenState.init(
+        const msg = buildRedrawMessageFromPty(
             self.allocator,
             pty_instance,
             .incremental,
         ) catch |err| {
-            std.log.err("Failed to copy screen state for session {}: {}", .{ pty_instance.id, err });
+            std.log.err("Failed to build redraw message for session {}: {}", .{ pty_instance.id, err });
             return;
         };
-        defer state.deinit();
+        defer self.allocator.free(msg);
 
-        const capture_time = std.time.nanoTimestamp();
-
-        // Determine mode from state (ScreenState.init can change mode from incremental to full)
-        const mode_str = if (state.rows_data.len == state.rows) "full" else "incremental";
+        const build_time = std.time.nanoTimestamp();
 
         // Build and send redraw notifications
-        self.sendRedraw(self.loop, pty_instance, &state, null, .incremental) catch |err| {
+        self.sendRedraw(self.loop, pty_instance, msg, null) catch |err| {
             std.log.err("Failed to send redraw for session {}: {}", .{ pty_instance.id, err });
         };
 
-        const end_time = std.time.nanoTimestamp();
-        const capture_us = @divTrunc(capture_time - start_time, std.time.ns_per_us);
-        const serialize_us = @divTrunc(end_time - capture_time, std.time.ns_per_us);
-        const total_us = @divTrunc(end_time - start_time, std.time.ns_per_us);
+        const send_time = std.time.nanoTimestamp();
+        const build_us = @divTrunc(build_time - start_time, std.time.ns_per_us);
+        const send_us = @divTrunc(send_time - build_time, std.time.ns_per_us);
 
-        std.log.info("renderFrame: mode={s} capture={}us serialize={}us total={}us", .{ mode_str, capture_us, serialize_us, total_us });
+        std.log.info("renderFrame: build={}us send={}us", .{ build_us, send_us });
 
         // Update timestamp
         pty_instance.last_render_time = std.time.milliTimestamp();
@@ -1473,6 +1382,51 @@ const Server = struct {
         for (self.clients.items) |client| {
             try client.sendData(self.loop, msg_bytes);
         }
+    }
+
+    fn shutdown(self: *Server) void {
+        std.log.info("Shutting down server...", .{});
+
+        // Stop accepting
+        self.accepting = false;
+        if (self.accept_task) |*task| {
+            task.cancel(self.loop) catch {};
+            self.accept_task = null;
+        }
+
+        // Close all clients
+        while (self.clients.items.len > 0) {
+            const client = self.clients.items[0];
+            self.removeClient(client);
+        }
+
+        // Cancel signal watcher
+        self.loop.cancelByFd(self.signal_pipe_fds[0]);
+    }
+
+    fn onSignal(loop: *io.Loop, completion: io.Completion) anyerror!void {
+        const self = completion.userdataCast(Server);
+
+        switch (completion.result) {
+            .read => |n| {
+                if (n == 0) return;
+                // Drain
+                var buf: [128]u8 = undefined;
+                while (true) {
+                    _ = posix.read(self.signal_pipe_fds[0], &buf) catch |err| {
+                        if (err == error.WouldBlock) break;
+                        break;
+                    };
+                }
+
+                self.shutdown();
+            },
+            .err => |err| {
+                std.log.err("Signal pipe error: {}", .{err});
+            },
+            else => {},
+        }
+        _ = loop;
     }
 
     fn onRenderTimer(loop: *io.Loop, completion: io.Completion) anyerror!void {
@@ -1594,6 +1548,18 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
     // Listen
     try posix.listen(listen_fd, 128);
 
+    // Create signal pipe
+    const signal_pipe_fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    signal_write_fd = signal_pipe_fds[1];
+
+    var sa: posix.Sigaction = .{
+        .handler = .{ .handler = signalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &sa, null);
+    posix.sigaction(posix.SIG.TERM, &sa, null);
+
     var server: Server = .{
         .allocator = allocator,
         .loop = &loop,
@@ -1601,8 +1567,11 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         .socket_path = socket_path,
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .signal_pipe_fds = signal_pipe_fds,
     };
     defer {
+        posix.close(signal_pipe_fds[0]);
+        posix.close(signal_pipe_fds[1]);
         for (server.clients.items) |client| {
             posix.close(client.fd);
             client.attached_sessions.deinit(allocator);
@@ -1621,6 +1590,12 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
     server.accept_task = try loop.accept(listen_fd, .{
         .ptr = &server,
         .cb = Server.onAccept,
+    });
+
+    // Register signal watcher
+    _ = try loop.read(signal_pipe_fds[0], &server.signal_buf, .{
+        .ptr = &server,
+        .cb = Server.onSignal,
     });
 
     // Run until server decides to exit
@@ -1645,6 +1620,7 @@ test "server lifecycle - shutdown when no clients" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .exit_on_idle = true,
+        .signal_pipe_fds = undefined,
     };
     defer server.clients.deinit(testing.allocator);
     defer server.ptys.deinit();
@@ -1676,6 +1652,7 @@ test "server lifecycle - accept client connection" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
+        .signal_pipe_fds = undefined,
     };
     defer {
         for (server.clients.items) |client| {
@@ -1711,6 +1688,7 @@ test "server lifecycle - client disconnect triggers shutdown" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .exit_on_idle = true,
+        .signal_pipe_fds = undefined,
     };
     defer {
         for (server.clients.items) |client| {
@@ -1752,6 +1730,7 @@ test "server lifecycle - multiple clients" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .exit_on_idle = true,
+        .signal_pipe_fds = undefined,
     };
     defer {
         for (server.clients.items) |client| {
@@ -1810,6 +1789,7 @@ test "server lifecycle - recv error triggers disconnect" {
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(testing.allocator),
         .exit_on_idle = true,
+        .signal_pipe_fds = undefined,
     };
     defer {
         for (server.clients.items) |client| {
@@ -1949,74 +1929,65 @@ test "parseDetachPtyParams" {
     try testing.expectEqual(@as(posix.fd_t, 10), args.client_fd);
 }
 
-test "buildRedrawMessage" {
-    const testing = std.testing;
-    var rows_data = std.ArrayList(ScreenState.DirtyRow).empty;
-    defer {
-        for (rows_data.items) |row| {
-            for (row.cells) |cell| testing.allocator.free(cell.text);
-            testing.allocator.free(row.cells);
-        }
-        rows_data.deinit(testing.allocator);
-    }
-
-    // Create a row with one cell
-    var cells = try testing.allocator.alloc(ScreenState.CellData, 1);
-    cells[0] = .{
-        .text = try testing.allocator.dupe(u8, "A"),
-        .style_id = 1,
-        .wide = false,
-    };
-    try rows_data.append(testing.allocator, .{ .y = 0, .cells = cells });
-
-    var styles_list = std.ArrayList(redraw.UIEvent.Style).empty;
-    defer styles_list.deinit(testing.allocator);
-    try styles_list.append(testing.allocator, .{ .id = 1, .attrs = .{ .fg = 0xFF0000 } });
-
-    var state = ScreenState{
-        .rows = 24,
-        .cols = 80,
-        .cursor_x = 5,
-        .cursor_y = 10,
-        .cursor_visible = true,
-        .cursor_shape = .block,
-        .rows_data = rows_data.items,
-        .styles = styles_list.items,
-        .viewport = undefined,
-        .arena = undefined,
-        .title = "Test Title",
-        .title_changed = true,
-    };
-
-    const msg = try Server.buildRedrawMessage(testing.allocator, 1, &state, .full);
-    defer testing.allocator.free(msg);
-
-    try testing.expect(msg.len > 0);
-}
-
-test "ScreenState style optimization" {
+test "buildRedrawMessageFromPty" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var pty_inst: Pty = undefined;
-    // Initialize with safe defaults for the fields we don't care about in this test
-    pty_inst = .{
-        .id = 0,
+    var pty_inst: Pty = .{
+        .id = 1,
         .process = .{ .master = -1, .slave = -1, .pid = 0 },
-        .clients = undefined, // Not used
-        .running = undefined, // Not used
-        .terminal = try ghostty_vt.Terminal.init(allocator, .{ .cols = 10, .rows = 2 }),
+        .clients = std.ArrayList(*Client).empty,
+        .running = std.atomic.Value(bool).init(true),
+        .terminal = try ghostty_vt.Terminal.init(allocator, .{ .cols = 80, .rows = 24 }),
         .allocator = allocator,
         .title = std.ArrayList(u8).empty,
         .title_dirty = false,
-        .pipe_fds = undefined, // Not used
-        .exit_pipe_fds = undefined, // Not used
+        .pipe_fds = undefined,
+        .exit_pipe_fds = undefined,
         .render_state = .empty,
-        .server_ptr = undefined, // Not used
+        .server_ptr = undefined,
     };
-    defer pty_inst.terminal.deinit(allocator);
-    defer pty_inst.render_state.deinit(allocator);
-    defer pty_inst.title.deinit(allocator);
+    defer {
+        pty_inst.terminal.deinit(allocator);
+        pty_inst.render_state.deinit(allocator);
+        pty_inst.clients.deinit(allocator);
+        pty_inst.title.deinit(allocator);
+    }
+
+    const msg = try buildRedrawMessageFromPty(allocator, &pty_inst, .full);
+    defer allocator.free(msg);
+
+    try testing.expect(msg.len > 0);
+
+    const value = try msgpack.decode(allocator, msg);
+    defer value.deinit(allocator);
+    try testing.expect(value == .array);
+}
+
+test "style optimization" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var pty_inst: Pty = .{
+        .id = 1,
+        .process = .{ .master = -1, .slave = -1, .pid = 0 },
+        .clients = std.ArrayList(*Client).empty,
+        .running = std.atomic.Value(bool).init(true),
+        .terminal = try ghostty_vt.Terminal.init(allocator, .{ .cols = 10, .rows = 5 }),
+        .allocator = allocator,
+        .title = std.ArrayList(u8).empty,
+        .title_dirty = false,
+        .pipe_fds = undefined,
+        .exit_pipe_fds = undefined,
+        .render_state = .empty,
+        .server_ptr = undefined,
+    };
+    defer {
+        pty_inst.terminal.deinit(allocator);
+        pty_inst.render_state.deinit(allocator);
+        pty_inst.clients.deinit(allocator);
+        pty_inst.title.deinit(allocator);
+    }
 
     const handler = vt_handler.Handler.init(&pty_inst.terminal);
     var stream = vt_handler.Stream.initAlloc(allocator, handler);
@@ -2024,12 +1995,8 @@ test "ScreenState style optimization" {
 
     // Row 0: A (Default), B (Red), C (Default)
     try stream.nextSlice(&[_]u8{'A'});
-
-    // B (Red)
     try stream.nextSlice("\x1b[31m");
     try stream.nextSlice(&[_]u8{'B'});
-
-    // C (Default)
     try stream.nextSlice("\x1b[0m");
     try stream.nextSlice(&[_]u8{'C'});
 
@@ -2040,39 +2007,63 @@ test "ScreenState style optimization" {
     try stream.nextSlice("\x1b[31m");
     try stream.nextSlice(&[_]u8{'D'});
 
-    var state = try ScreenState.init(allocator, &pty_inst, .full);
-    defer state.deinit();
+    const msg = try buildRedrawMessageFromPty(allocator, &pty_inst, .full);
+    defer allocator.free(msg);
 
-    // Find row 0 and 1
-    var row0: ?ScreenState.DirtyRow = null;
-    var row1: ?ScreenState.DirtyRow = null;
+    const value = try msgpack.decode(allocator, msg);
+    defer value.deinit(allocator);
 
-    for (state.rows_data) |row| {
-        if (row.y == 0) row0 = row;
-        if (row.y == 1) row1 = row;
+    // Verify results by inspecting msgpack events
+    const events = value.array[2].array;
+    var style_def_red: ?u32 = null;
+    var found_row0 = false;
+    var found_row1 = false;
+
+    for (events) |evt_val| {
+        const name = evt_val.array[0].string;
+        const args = evt_val.array[1].array;
+
+        if (std.mem.eql(u8, name, "style")) {
+            const id = @as(u32, @intCast(args[0].unsigned));
+            const attrs_map = args[1].map;
+            for (attrs_map) |kv| {
+                if (std.mem.eql(u8, kv.key.string, "fg") and kv.value.unsigned == 0xFF0000) {
+                    style_def_red = id;
+                }
+                if (std.mem.eql(u8, kv.key.string, "fg_idx") and kv.value.unsigned == 1) {
+                    style_def_red = id;
+                }
+            }
+        } else if (std.mem.eql(u8, name, "write")) {
+            const row = @as(u16, @intCast(args[1].unsigned));
+            const cells_arr = args[3].array;
+
+            if (row == 0) {
+                found_row0 = true;
+                // Cell 1 should be B with red style
+                const cell1 = cells_arr[1].array;
+                try testing.expectEqualStrings("B", cell1[0].string);
+                if (cell1.len > 1 and cell1[1] != .nil) {
+                    const sid = @as(u32, @intCast(cell1[1].unsigned));
+                    try testing.expectEqual(style_def_red.?, sid);
+                }
+            }
+            if (row == 1) {
+                found_row1 = true;
+                // Cell 0 should be D with red style
+                const cell0 = cells_arr[0].array;
+                try testing.expectEqualStrings("D", cell0[0].string);
+                if (cell0.len > 1 and cell0[1] != .nil) {
+                    const sid = @as(u32, @intCast(cell0[1].unsigned));
+                    try testing.expectEqual(style_def_red.?, sid);
+                }
+            }
+        }
     }
 
-    try testing.expect(row0 != null);
-    const r0 = row0.?;
-    try testing.expectEqualStrings("A", r0.cells[0].text);
-    const style_default_id = r0.cells[0].style_id;
-
-    try testing.expectEqualStrings("B", r0.cells[1].text);
-    const red_style_id = r0.cells[1].style_id;
-    try testing.expect(red_style_id != style_default_id);
-
-    try testing.expectEqualStrings("C", r0.cells[2].text);
-    try testing.expectEqual(style_default_id, r0.cells[2].style_id);
-
-    try testing.expect(row1 != null);
-    const r1 = row1.?;
-    try testing.expectEqualStrings("D", r1.cells[0].text);
-    const d_style_id = r1.cells[0].style_id;
-
-    // D should have the same Red style ID as B
-    try testing.expectEqual(red_style_id, d_style_id);
-    // And definitely not the default style ID
-    try testing.expect(d_style_id != style_default_id);
+    try testing.expect(style_def_red != null);
+    try testing.expect(found_row0);
+    try testing.expect(found_row1);
 }
 
 test "server - pty exit notification" {
@@ -2089,6 +2080,7 @@ test "server - pty exit notification" {
         .socket_path = "/tmp/test.sock",
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .signal_pipe_fds = undefined,
     };
     defer {
         // cleanup

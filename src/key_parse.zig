@@ -178,10 +178,24 @@ pub fn parseKeyMap(map: msgpack.Value) !KeyEvent {
         break :codepoint cp;
     };
 
+    // Determine consumed_mods: if shift was used to produce a different character
+    // (e.g., shift+; produces ":"), mark shift as consumed so the encoder treats
+    // it as a plain character, not as shift+semicolon.
+    const utf8_codepoint: u21 = utf8_cp: {
+        if (utf8.len == 0) break :utf8_cp 0;
+        const view = std.unicode.Utf8View.init(utf8) catch break :utf8_cp 0;
+        var it = view.iterator();
+        break :utf8_cp it.nextCodepoint() orelse 0;
+    };
+
+    const shift_consumed = mods.shift and unshifted_codepoint != 0 and
+        utf8_codepoint != 0 and unshifted_codepoint != utf8_codepoint;
+
     return .{
         .key = key_enum,
         .utf8 = utf8,
         .mods = @bitCast(mods),
+        .consumed_mods = .{ .shift = shift_consumed },
         .unshifted_codepoint = unshifted_codepoint,
     };
 }

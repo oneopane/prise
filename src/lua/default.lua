@@ -379,11 +379,6 @@ function M.update(event)
             -- First terminal
             state.root = new_pane
             state.focused_id = new_pane.id
-
-            -- Auto-spawn second terminal for convenience
-            prise.log.info("Lua: spawning second terminal")
-            prise.spawn({})
-            state.pending_split = { direction = "row" }
         else
             -- Insert into tree
             local direction = (state.pending_split and state.pending_split.direction) or "row"

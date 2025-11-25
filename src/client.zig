@@ -168,6 +168,7 @@ pub const ClientState = struct {
     pub const RequestInfo = union(enum) {
         spawn,
         attach: i64,
+        detach,
     };
 
     pub fn init(allocator: std.mem.Allocator) ClientState {
@@ -188,6 +189,7 @@ pub const ServerAction = union(enum) {
     redraw: msgpack.Value,
     attached: i64,
     pty_exited: struct { pty_id: u32, status: u32 },
+    detached,
 };
 
 pub const PipeAction = union(enum) {
@@ -231,6 +233,9 @@ pub const ClientLogic = struct {
                                 state.pty_id = id;
                                 state.attached = true;
                                 return ServerAction{ .attached = id };
+                            },
+                            .detach => {
+                                return ServerAction.detached;
                             },
                         }
                     } else {
@@ -634,40 +639,43 @@ pub const App = struct {
                 const app_ptr: *App = @ptrCast(@alignCast(ctx));
                 try app_ptr.saveSession(session_name);
 
-                // Send detach_pty for each attached session to mark them keep_alive
+                // Build array of PTY IDs to detach
+                var pty_ids = try app_ptr.allocator.alloc(msgpack.Value, app_ptr.surfaces.count());
+                defer app_ptr.allocator.free(pty_ids);
+                var i: usize = 0;
                 var key_iter = app_ptr.surfaces.keyIterator();
                 while (key_iter.next()) |pty_id| {
-                    var params = try app_ptr.allocator.alloc(msgpack.Value, 2);
-                    params[0] = .{ .unsigned = pty_id.* };
-                    params[1] = .{ .unsigned = @intCast(app_ptr.fd) };
+                    pty_ids[i] = .{ .unsigned = pty_id.* };
+                    i += 1;
+                }
 
-                    var arr = try app_ptr.allocator.alloc(msgpack.Value, 3);
-                    arr[0] = .{ .unsigned = 2 }; // notification
-                    arr[1] = .{ .string = "detach_pty" };
-                    arr[2] = .{ .array = params };
+                // Send single detach_session request with all PTY IDs
+                const msgid = app_ptr.state.next_msgid;
+                app_ptr.state.next_msgid +%= 1;
 
-                    const encoded = msgpack.encodeFromValue(app_ptr.allocator, msgpack.Value{ .array = arr }) catch continue;
-                    defer app_ptr.allocator.free(encoded);
+                var params = try app_ptr.allocator.alloc(msgpack.Value, 2);
+                params[0] = .{ .array = pty_ids };
+                params[1] = .{ .unsigned = @intCast(app_ptr.fd) };
+
+                var arr = try app_ptr.allocator.alloc(msgpack.Value, 4);
+                arr[0] = .{ .unsigned = 0 }; // request
+                arr[1] = .{ .unsigned = msgid };
+                arr[2] = .{ .string = "detach_ptys" };
+                arr[3] = .{ .array = params };
+
+                const encoded = msgpack.encodeFromValue(app_ptr.allocator, msgpack.Value{ .array = arr }) catch {
                     app_ptr.allocator.free(arr);
                     app_ptr.allocator.free(params);
+                    return;
+                };
+                defer app_ptr.allocator.free(encoded);
+                app_ptr.allocator.free(arr);
+                app_ptr.allocator.free(params);
 
-                    app_ptr.sendDirect(encoded) catch {};
-                }
+                // Track that we're waiting for detach response
+                try app_ptr.state.pending_requests.put(msgid, .detach);
 
-                // Same cleanup as quit
-                app_ptr.state.should_quit = true;
-                if (app_ptr.connected) {
-                    posix.close(app_ptr.fd);
-                    app_ptr.connected = false;
-                }
-                if (app_ptr.recv_task) |*task| {
-                    if (app_ptr.io_loop) |l| task.cancel(l) catch {};
-                    app_ptr.recv_task = null;
-                }
-                if (app_ptr.render_timer) |*task| {
-                    if (app_ptr.io_loop) |l| task.cancel(l) catch {};
-                    app_ptr.render_timer = null;
-                }
+                app_ptr.sendDirect(encoded) catch {};
             }
         }.detachCb);
 
@@ -1613,6 +1621,17 @@ pub const App = struct {
                                 app.ui.update(.{ .pty_exited = .{ .id = info.pty_id, .status = info.status } }) catch |err| {
                                     std.log.err("Failed to update UI with pty_exited: {}", .{err});
                                 };
+                            },
+                            .detached => {
+                                std.log.info("Detach complete, closing connection", .{});
+                                app.state.should_quit = true;
+                                if (app.connected) {
+                                    posix.close(app.fd);
+                                    app.connected = false;
+                                }
+                                // Wake up TTY thread so it can exit
+                                app.vx.deviceStatusReport(app.tty.writer()) catch {};
+                                return;
                             },
                             .none => {},
                         }

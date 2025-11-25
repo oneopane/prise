@@ -1492,6 +1492,58 @@ const Server = struct {
             }
 
             return msgpack.Value.nil;
+        } else if (std.mem.eql(u8, method, "detach_ptys")) {
+            // params: [pty_ids_array, client_fd]
+            const params_arr = switch (params) {
+                .array => |arr| arr,
+                else => return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") },
+            };
+            if (params_arr.len < 2) {
+                return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
+            }
+            const pty_ids = switch (params_arr[0]) {
+                .array => |arr| arr,
+                else => return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") },
+            };
+            const client_fd: posix.fd_t = switch (params_arr[1]) {
+                .unsigned => |u| @intCast(u),
+                .integer => |i| @intCast(i),
+                else => return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") },
+            };
+
+            // Find client by fd
+            var matching_client: ?*Client = null;
+            for (self.clients.items) |c| {
+                if (c.fd == client_fd) {
+                    matching_client = c;
+                    break;
+                }
+            }
+
+            for (pty_ids) |pty_id_val| {
+                const pty_id: usize = switch (pty_id_val) {
+                    .unsigned => |u| u,
+                    .integer => |i| @intCast(i),
+                    else => continue,
+                };
+
+                if (self.ptys.get(pty_id)) |pty_instance| {
+                    pty_instance.keep_alive = true;
+
+                    if (matching_client) |c| {
+                        pty_instance.removeClient(c);
+                        for (c.attached_sessions.items, 0..) |sid, i| {
+                            if (sid == pty_id) {
+                                _ = c.attached_sessions.swapRemove(i);
+                                break;
+                            }
+                        }
+                    }
+                    std.log.info("PTY {} marked keep_alive", .{pty_id});
+                }
+            }
+
+            return msgpack.Value.nil;
         } else if (std.mem.eql(u8, method, "get_selection")) {
             const pty_id = parsePtyId(params) catch {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
@@ -1826,6 +1878,10 @@ const Server = struct {
                     };
                     // Render final frame
                     server.renderFrame(pty_instance);
+                    // Remove from server's pty map and clean up
+                    // Process already exited, so just join thread and free resources
+                    _ = server.ptys.fetchRemove(pty_instance.id);
+                    pty_instance.joinAndFree(server.allocator);
                     return;
                 }
 
@@ -2465,20 +2521,7 @@ test "server - pty exit notification" {
             allocator.destroy(client);
         }
         server.clients.deinit(allocator);
-        // pty cleanup is manual here since we don't use full server lifecycle
-        var it = server.ptys.valueIterator();
-        while (it.next()) |p| {
-            // Manually cleanup pty resources
-            posix.close(p.*.pipe_fds[0]);
-            posix.close(p.*.pipe_fds[1]);
-            posix.close(p.*.exit_pipe_fds[0]);
-            posix.close(p.*.exit_pipe_fds[1]);
-            p.*.terminal.deinit(allocator);
-            p.*.render_state.deinit(allocator);
-            p.*.clients.deinit(allocator);
-            p.*.title.deinit(allocator);
-            allocator.destroy(p.*);
-        }
+        // PTY is now cleaned up by onPtyDirty when it exits, so just deinit the map
         server.ptys.deinit();
     }
 

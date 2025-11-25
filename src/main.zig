@@ -41,51 +41,12 @@ pub fn main() !void {
         }
     }
 
-    // Check if socket exists
     std.fs.accessAbsolute(socket_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
-            const pid = try posix.fork();
-            if (pid == 0) {
-                // Child process - daemonize
-                _ = posix.setsid() catch |e| {
-                    std.log.err("setsid failed: {}", .{e});
-                    std.posix.exit(1);
-                };
-
-                // Fork again to prevent acquiring controlling terminal
-                const pid2 = try posix.fork();
-                if (pid2 != 0) {
-                    // First child exits
-                    std.posix.exit(0);
-                }
-
-                // Grandchild - actual server daemon
-                // Close stdio and redirect stderr to log file
-                posix.close(posix.STDIN_FILENO);
-                posix.close(posix.STDOUT_FILENO);
-
-                var log_buffer: [256]u8 = undefined;
-                const log_path = try std.fmt.bufPrint(&log_buffer, "/tmp/prise-{d}.log", .{uid});
-                const log_fd = try posix.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
-                try posix.dup2(log_fd, posix.STDERR_FILENO);
-                posix.close(log_fd);
-
-                // Start server
-                try server.startServer(allocator, socket_path);
-                return;
-            } else {
-                // Parent process - wait for socket to appear
-                std.log.info("Forked server with PID {}", .{pid});
-                var retries: u8 = 0;
-                while (retries < 10) : (retries += 1) {
-                    std.Thread.sleep(50 * std.time.ns_per_ms);
-                    std.fs.accessAbsolute(socket_path, .{}) catch continue;
-                    break;
-                }
-            }
-        } else {
-            return err;
+            std.log.err("Server not running. Start it with: prise serve", .{});
+            return error.ServerNotRunning;
         }
+        return err;
     };
 
     std.log.info("Connecting to server at {s}", .{socket_path});
@@ -106,68 +67,9 @@ pub fn main() !void {
     try loop.run(.until_done);
 
     if (app.state.connection_refused) {
-        // Stale socket - remove it and fork server
-        std.log.info("Stale socket detected, removing and starting server", .{});
+        std.log.err("Connection refused. Server may have crashed. Start it with: prise serve", .{});
         posix.unlink(socket_path) catch {};
-
-        const pid = try posix.fork();
-        if (pid == 0) {
-            // Child process - daemonize
-            _ = posix.setsid() catch |e| {
-                std.log.err("setsid failed: {}", .{e});
-                std.posix.exit(1);
-            };
-
-            // Fork again to prevent acquiring controlling terminal
-            const pid2 = try posix.fork();
-            if (pid2 != 0) {
-                // First child exits
-                std.posix.exit(0);
-            }
-
-            // Grandchild - actual server daemon
-            // Close stdio and redirect stderr to log file
-            posix.close(posix.STDIN_FILENO);
-            posix.close(posix.STDOUT_FILENO);
-
-            var log_buffer: [256]u8 = undefined;
-            const log_path = try std.fmt.bufPrint(&log_buffer, "/tmp/prise-{d}.log", .{uid});
-            const log_fd = try posix.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
-            try posix.dup2(log_fd, posix.STDERR_FILENO);
-            posix.close(log_fd);
-
-            // Start server
-            try server.startServer(allocator, socket_path);
-            return;
-        } else {
-            // Parent process - wait for socket to appear then retry
-            std.log.info("Forked server with PID {}", .{pid});
-            var retries: u8 = 0;
-            while (retries < 10) : (retries += 1) {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
-                std.fs.accessAbsolute(socket_path, .{}) catch continue;
-                break;
-            }
-
-            // Retry connection - reuse existing app/loop
-            _ = try client.connectUnixSocket(
-                &loop,
-                socket_path,
-                .{ .ptr = &app, .cb = client.App.onConnected },
-            );
-            try loop.run(.until_done);
-        }
-    }
-
-    if (app.connected) {
-        if (app.state.response_received) {
-            if (app.state.pty_id) |pty_id| {
-                std.log.info("Ready with PTY ID: {}", .{pty_id});
-                // Keep connection alive to see terminal output
-                std.log.info("Waiting for terminal output...", .{});
-                std.Thread.sleep(4 * std.time.ns_per_s);
-            }
-        }
+        return error.ConnectionRefused;
     }
 }
 

@@ -1365,6 +1365,9 @@ const Client = struct {
                         }
 
                         if (self.server.ptys.get(pty_id)) |pty_instance| {
+                            // Lock mutex before any terminal state access to avoid race with read thread
+                            pty_instance.terminal_mutex.lock();
+
                             log.info("resize_pty: pty={} requested={}x{} ({}x{}px) current_terminal={}x{}", .{
                                 pty_id,
                                 cols,
@@ -1385,9 +1388,6 @@ const Client = struct {
                             pty_mut.setSize(size) catch |err| {
                                 log.err("Resize PTY failed: {}", .{err});
                             };
-
-                            // Also resize the terminal state
-                            pty_instance.terminal_mutex.lock();
                             if (pty_instance.terminal.rows != rows or pty_instance.terminal.cols != cols) {
                                 log.info("resize_pty: resizing terminal from {}x{} to {}x{}", .{
                                     pty_instance.terminal.cols,

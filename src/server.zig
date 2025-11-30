@@ -362,6 +362,11 @@ const Pty = struct {
             } else {
                 log.info("PTY {} process {} still alive, sending KILL", .{ self.id, self.process.pid });
                 _ = posix.kill(-self.process.pid, posix.SIG.KILL) catch {};
+                // SIGKILL can't be caught - block until process exits
+                const kill_result = posix.waitpid(self.process.pid, 0);
+                status = kill_result.status;
+                log.info("PTY {} process {} exited with status {}", .{ self.id, self.process.pid, status });
+                break;
             }
             attempts += 1;
             std.Thread.sleep(10 * std.time.ns_per_ms);

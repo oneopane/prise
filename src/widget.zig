@@ -149,340 +149,13 @@ pub const Widget = struct {
                 .width = constraints.max_width orelse 20,
                 .height = @min(@as(u16, @intCast(l.items.len)), constraints.max_height orelse @as(u16, @intCast(l.items.len))),
             },
-            .box => |*b| blk: {
-                const border_size: u16 = if (b.border == .none) 0 else 2;
-
-                // Apply box's own constraints on top of parent constraints
-                const effective_max_w = if (b.max_width) |bw|
-                    if (constraints.max_width) |cw| @min(bw, cw) else bw
-                else
-                    constraints.max_width;
-                const effective_max_h = if (b.max_height) |bh|
-                    if (constraints.max_height) |ch| @min(bh, ch) else bh
-                else
-                    constraints.max_height;
-
-                const inner_max_w = if (effective_max_w) |w| (if (w > border_size) w - border_size else 0) else null;
-                const inner_max_h = if (effective_max_h) |h| (if (h > border_size) h - border_size else 0) else null;
-
-                const child_size = b.child.layout(.{
-                    .min_width = 0,
-                    .max_width = inner_max_w,
-                    .min_height = 0,
-                    .max_height = inner_max_h,
-                });
-                b.child.x = if (b.border == .none) 0 else 1;
-                b.child.y = if (b.border == .none) 0 else 1;
-                b.child.width = child_size.width;
-                b.child.height = child_size.height;
-
-                break :blk Size{
-                    .width = child_size.width + border_size,
-                    .height = child_size.height + border_size,
-                };
-            },
-            .padding => |*p| blk: {
-                const h_padding = p.left + p.right;
-                const v_padding = p.top + p.bottom;
-
-                const inner_max_w = if (constraints.max_width) |w| (if (w > h_padding) w - h_padding else 0) else null;
-                const inner_max_h = if (constraints.max_height) |h| (if (h > v_padding) h - v_padding else 0) else null;
-
-                const child_size = p.child.layout(.{
-                    .min_width = 0,
-                    .max_width = inner_max_w,
-                    .min_height = 0,
-                    .max_height = inner_max_h,
-                });
-                p.child.x = p.left;
-                p.child.y = p.top;
-                p.child.width = child_size.width;
-                p.child.height = child_size.height;
-
-                break :blk Size{
-                    .width = child_size.width + h_padding,
-                    .height = child_size.height + v_padding,
-                };
-            },
-            .column => |*col| blk: {
-                const total_height = constraints.max_height orelse 0;
-                var width: u16 = 0;
-
-                // Pass 1: Measure intrinsic children (text) and count proportional children
-                var intrinsic_height: u16 = 0;
-                var nil_count: u16 = 0;
-
-                for (col.children) |*child| {
-                    const is_intrinsic = child.ratio == null and (child.kind == .text or child.kind == .text_input or child.kind == .list);
-                    if (is_intrinsic) {
-                        const remaining = if (total_height > intrinsic_height) total_height - intrinsic_height else 0;
-                        const child_constraints: BoxConstraints = .{
-                            .min_width = 0,
-                            .max_width = constraints.max_width,
-                            .min_height = 0,
-                            .max_height = remaining,
-                        };
-                        const child_size = child.layout(child_constraints);
-                        child.height = child_size.height;
-                        child.width = child_size.width;
-                        intrinsic_height += child_size.height;
-                        if (child_size.width > width) width = child_size.width;
-                    } else if (child.ratio == null) {
-                        nil_count += 1;
-                    }
-                }
-
-                // Available space for ratio/nil children
-                const available = if (total_height > intrinsic_height) total_height - intrinsic_height else 0;
-
-                // Pass 2: Allocate ratio children
-                var used_by_ratio: u16 = 0;
-                for (col.children) |*child| {
-                    if (child.ratio) |r| {
-                        const share: u16 = @intFromFloat(@as(f32, @floatFromInt(available)) * r);
-                        const child_constraints: BoxConstraints = .{
-                            .min_width = 0,
-                            .max_width = constraints.max_width,
-                            .min_height = share,
-                            .max_height = share,
-                        };
-                        const child_size = child.layout(child_constraints);
-                        child.height = child_size.height;
-                        child.width = child_size.width;
-                        used_by_ratio += share;
-                        if (child_size.width > width) width = child_size.width;
-                    }
-                }
-
-                // Pass 3: Split remaining among nil-ratio non-intrinsic children equally
-                const remaining_for_nil = if (available > used_by_ratio) available - used_by_ratio else 0;
-                if (nil_count > 0 and remaining_for_nil > 0) {
-                    var remaining = remaining_for_nil;
-                    var count = nil_count;
-                    for (col.children) |*child| {
-                        const is_intrinsic = child.kind == .text or child.kind == .text_input or child.kind == .list;
-                        if (child.ratio == null and !is_intrinsic) {
-                            const share = remaining / count;
-                            remaining -= share;
-                            count -= 1;
-
-                            const child_constraints: BoxConstraints = .{
-                                .min_width = 0,
-                                .max_width = constraints.max_width,
-                                .min_height = share,
-                                .max_height = share,
-                            };
-                            const child_size = child.layout(child_constraints);
-                            child.height = child_size.height;
-                            child.width = child_size.width;
-                            if (child_size.width > width) width = child_size.width;
-                        }
-                    }
-                }
-
-                // Final pass: Position children
-                var current_y: u16 = 0;
-                var final_height: u16 = 0;
-                for (col.children) |*child| {
-                    log.debug("Column child kind={} h={}", .{ child.kind, child.height });
-                    child.y = current_y;
-
-                    switch (col.cross_axis_align) {
-                        .start => child.x = 0,
-                        .center => child.x = if (width > child.width) (width - child.width) / 2 else 0,
-                        .end => child.x = if (width > child.width) width - child.width else 0,
-                        .stretch => {
-                            child.x = 0;
-                            child.width = width;
-                        },
-                    }
-
-                    current_y += child.height;
-                    final_height += child.height;
-                }
-
-                break :blk Size{
-                    .width = width,
-                    .height = final_height,
-                };
-            },
-            .row => |*row| blk: {
-                const total_width = constraints.max_width orelse 0;
-                var height: u16 = 0;
-
-                // Pass 1: Measure intrinsic children (text) and count proportional children
-                var intrinsic_width: u16 = 0;
-                var nil_count: u16 = 0;
-
-                for (row.children) |*child| {
-                    const is_intrinsic = child.ratio == null and child.kind == .text;
-                    if (is_intrinsic) {
-                        const remaining = if (total_width > intrinsic_width) total_width - intrinsic_width else 0;
-                        const child_constraints: BoxConstraints = .{
-                            .min_width = 0,
-                            .max_width = remaining,
-                            .min_height = 0,
-                            .max_height = constraints.max_height,
-                        };
-                        const child_size = child.layout(child_constraints);
-                        child.height = child_size.height;
-                        child.width = child_size.width;
-                        intrinsic_width += child_size.width;
-                        if (child_size.height > height) height = child_size.height;
-                    } else if (child.ratio == null) {
-                        nil_count += 1;
-                    }
-                }
-
-                // Available space for ratio/nil children
-                const available = if (total_width > intrinsic_width) total_width - intrinsic_width else 0;
-
-                // Pass 2: Allocate ratio children
-                var used_by_ratio: u16 = 0;
-                for (row.children) |*child| {
-                    if (child.ratio) |r| {
-                        const share: u16 = @intFromFloat(@as(f32, @floatFromInt(available)) * r);
-                        const child_constraints: BoxConstraints = .{
-                            .min_width = share,
-                            .max_width = share,
-                            .min_height = 0,
-                            .max_height = constraints.max_height,
-                        };
-                        const child_size = child.layout(child_constraints);
-                        child.height = child_size.height;
-                        child.width = child_size.width;
-                        used_by_ratio += share;
-                        if (child_size.height > height) height = child_size.height;
-                    }
-                }
-
-                // Pass 3: Split remaining among nil-ratio non-intrinsic children equally
-                const remaining_for_nil = if (available > used_by_ratio) available - used_by_ratio else 0;
-                if (nil_count > 0 and remaining_for_nil > 0) {
-                    var remaining = remaining_for_nil;
-                    var count = nil_count;
-                    for (row.children) |*child| {
-                        const is_intrinsic = child.kind == .text;
-                        if (child.ratio == null and !is_intrinsic) {
-                            const share = remaining / count;
-                            remaining -= share;
-                            count -= 1;
-
-                            const child_constraints: BoxConstraints = .{
-                                .min_width = share,
-                                .max_width = share,
-                                .min_height = 0,
-                                .max_height = constraints.max_height,
-                            };
-                            const child_size = child.layout(child_constraints);
-                            child.height = child_size.height;
-                            child.width = child_size.width;
-                            if (child_size.height > height) height = child_size.height;
-                        }
-                    }
-                }
-
-                // Final pass: Position children
-                var current_x: u16 = 0;
-                var final_width: u16 = 0;
-                for (row.children) |*child| {
-                    child.x = current_x;
-
-                    switch (row.cross_axis_align) {
-                        .start => child.y = 0,
-                        .center => child.y = if (height > child.height) (height - child.height) / 2 else 0,
-                        .end => child.y = if (height > child.height) height - child.height else 0,
-                        .stretch => {
-                            child.y = 0;
-                            child.height = height;
-                        },
-                    }
-
-                    current_x += child.width;
-                    final_width += child.width;
-                }
-
-                break :blk Size{
-                    .width = final_width,
-                    .height = height,
-                };
-            },
-            .text => |*text| blk: {
-                // For layout, we need to iterate to calculate height.
-                // But iterator allocates. Since layout is called often, we should probably
-                // try to minimize allocation. However, strict correctness for wrapping requires
-                // the full iteration logic.
-                //
-                // We can use a GPA for layout which is acceptable as layout is usually
-                // per-frame or per-resize.
-                var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-                const alloc = gpa.allocator();
-                defer _ = gpa.deinit();
-
-                var iter: Text.Iterator = .{
-                    .text = text.*,
-                    .max_width = constraints.max_width orelse 65535,
-                    .allocator = alloc,
-                };
-
-                var max_w: u16 = 0;
-                var height: u16 = 0;
-
-                while (iter.next() catch null) |line| {
-                    defer alloc.free(line.segments);
-                    if (line.width > max_w) max_w = line.width;
-                    height += 1;
-                }
-
-                break :blk Size{
-                    .width = max_w,
-                    .height = height,
-                };
-            },
-            .stack => |*stack| blk: {
-                var max_width: u16 = 0;
-                var max_height: u16 = 0;
-
-                for (stack.children) |*child| {
-                    const child_size = child.layout(constraints);
-                    child.x = 0;
-                    child.y = 0;
-                    if (child_size.width > max_width) max_width = child_size.width;
-                    if (child_size.height > max_height) max_height = child_size.height;
-                }
-
-                break :blk Size{
-                    .width = max_width,
-                    .height = max_height,
-                };
-            },
-            .positioned => |*pos| blk: {
-                const child_size = pos.child.layout(constraints);
-
-                const container_width = constraints.max_width orelse child_size.width;
-                const container_height = constraints.max_height orelse child_size.height;
-
-                const anchor_x: u16 = switch (pos.anchor) {
-                    .top_left, .center_left, .bottom_left => 0,
-                    .top_center, .center, .bottom_center => if (container_width > child_size.width) (container_width - child_size.width) / 2 else 0,
-                    .top_right, .center_right, .bottom_right => if (container_width > child_size.width) container_width - child_size.width else 0,
-                };
-                const anchor_y: u16 = switch (pos.anchor) {
-                    .top_left, .top_center, .top_right => 0,
-                    .center_left, .center, .center_right => if (container_height > child_size.height) (container_height - child_size.height) / 2 else 0,
-                    .bottom_left, .bottom_center, .bottom_right => if (container_height > child_size.height) container_height - child_size.height else 0,
-                };
-
-                pos.child.x = pos.x orelse anchor_x;
-                pos.child.y = pos.y orelse anchor_y;
-                pos.child.width = child_size.width;
-                pos.child.height = child_size.height;
-
-                break :blk Size{
-                    .width = pos.child.x + child_size.width,
-                    .height = pos.child.y + child_size.height,
-                };
-            },
+            .box => |*b| layoutBoxImpl(b, constraints),
+            .padding => |*p| layoutPaddingImpl(p, constraints),
+            .column => |*col| layoutColumnImpl(col, constraints),
+            .row => |*row| layoutRowImpl(row, constraints),
+            .text => |*text| layoutTextImpl(text, constraints),
+            .stack => |*stack| layoutStackImpl(stack, constraints),
+            .positioned => |*pos| layoutPositionedImpl(pos, constraints),
         };
         self.width = size.width;
         self.height = size.height;
@@ -1944,4 +1617,345 @@ test "parseWidget - positioned" {
     try testing.expectEqual(@as(?u16, 10), w.kind.positioned.x);
     try testing.expectEqual(@as(?u16, 5), w.kind.positioned.y);
     try testing.expectEqual(Anchor.center, w.kind.positioned.anchor);
+}
+
+fn layoutBoxImpl(b: *Box, constraints: BoxConstraints) Size {
+    const border_size: u16 = if (b.border == .none) 0 else 2;
+
+    // Apply box's own constraints on top of parent constraints
+    const effective_max_w = if (b.max_width) |bw|
+        if (constraints.max_width) |cw| @min(bw, cw) else bw
+    else
+        constraints.max_width;
+    const effective_max_h = if (b.max_height) |bh|
+        if (constraints.max_height) |ch| @min(bh, ch) else bh
+    else
+        constraints.max_height;
+
+    const inner_max_w = if (effective_max_w) |w| (if (w > border_size) w - border_size else 0) else null;
+    const inner_max_h = if (effective_max_h) |h| (if (h > border_size) h - border_size else 0) else null;
+
+    const child_size = b.child.layout(.{
+        .min_width = 0,
+        .max_width = inner_max_w,
+        .min_height = 0,
+        .max_height = inner_max_h,
+    });
+    b.child.x = if (b.border == .none) 0 else 1;
+    b.child.y = if (b.border == .none) 0 else 1;
+    b.child.width = child_size.width;
+    b.child.height = child_size.height;
+
+    return Size{
+        .width = child_size.width + border_size,
+        .height = child_size.height + border_size,
+    };
+}
+
+fn layoutPaddingImpl(p: *Padding, constraints: BoxConstraints) Size {
+    const h_padding = p.left + p.right;
+    const v_padding = p.top + p.bottom;
+
+    const inner_max_w = if (constraints.max_width) |w| (if (w > h_padding) w - h_padding else 0) else null;
+    const inner_max_h = if (constraints.max_height) |h| (if (h > v_padding) h - v_padding else 0) else null;
+
+    const child_size = p.child.layout(.{
+        .min_width = 0,
+        .max_width = inner_max_w,
+        .min_height = 0,
+        .max_height = inner_max_h,
+    });
+    p.child.x = p.left;
+    p.child.y = p.top;
+    p.child.width = child_size.width;
+    p.child.height = child_size.height;
+
+    return Size{
+        .width = child_size.width + h_padding,
+        .height = child_size.height + v_padding,
+    };
+}
+
+fn layoutColumnImpl(col: *Column, constraints: BoxConstraints) Size {
+    const total_height = constraints.max_height orelse 0;
+    var width: u16 = 0;
+
+    // Pass 1: Measure intrinsic children (text) and count proportional children
+    var intrinsic_height: u16 = 0;
+    var nil_count: u16 = 0;
+
+    for (col.children) |*child| {
+        const is_intrinsic = child.ratio == null and (child.kind == .text or child.kind == .text_input or child.kind == .list);
+        if (is_intrinsic) {
+            const remaining = if (total_height > intrinsic_height) total_height - intrinsic_height else 0;
+            const child_constraints: BoxConstraints = .{
+                .min_width = 0,
+                .max_width = constraints.max_width,
+                .min_height = 0,
+                .max_height = remaining,
+            };
+            const child_size = child.layout(child_constraints);
+            child.height = child_size.height;
+            child.width = child_size.width;
+            intrinsic_height += child_size.height;
+            if (child_size.width > width) width = child_size.width;
+        } else if (child.ratio == null) {
+            nil_count += 1;
+        }
+    }
+
+    // Available space for ratio/nil children
+    const available = if (total_height > intrinsic_height) total_height - intrinsic_height else 0;
+
+    // Pass 2: Allocate ratio children
+    var used_by_ratio: u16 = 0;
+    for (col.children) |*child| {
+        if (child.ratio) |r| {
+            const share: u16 = @intFromFloat(@as(f32, @floatFromInt(available)) * r);
+            const child_constraints: BoxConstraints = .{
+                .min_width = 0,
+                .max_width = constraints.max_width,
+                .min_height = share,
+                .max_height = share,
+            };
+            const child_size = child.layout(child_constraints);
+            child.height = child_size.height;
+            child.width = child_size.width;
+            used_by_ratio += share;
+            if (child_size.width > width) width = child_size.width;
+        }
+    }
+
+    // Pass 3: Split remaining among nil-ratio non-intrinsic children equally
+    const remaining_for_nil = if (available > used_by_ratio) available - used_by_ratio else 0;
+    if (nil_count > 0 and remaining_for_nil > 0) {
+        var remaining = remaining_for_nil;
+        var count = nil_count;
+        for (col.children) |*child| {
+            const is_intrinsic = child.kind == .text or child.kind == .text_input or child.kind == .list;
+            if (child.ratio == null and !is_intrinsic) {
+                const share = remaining / count;
+                remaining -= share;
+                count -= 1;
+
+                const child_constraints: BoxConstraints = .{
+                    .min_width = 0,
+                    .max_width = constraints.max_width,
+                    .min_height = share,
+                    .max_height = share,
+                };
+                const child_size = child.layout(child_constraints);
+                child.height = child_size.height;
+                child.width = child_size.width;
+                if (child_size.width > width) width = child_size.width;
+            }
+        }
+    }
+
+    // Final pass: Position children
+    var current_y: u16 = 0;
+    var final_height: u16 = 0;
+    for (col.children) |*child| {
+        log.debug("Column child kind={} h={}", .{ child.kind, child.height });
+        child.y = current_y;
+
+        switch (col.cross_axis_align) {
+            .start => child.x = 0,
+            .center => child.x = if (width > child.width) (width - child.width) / 2 else 0,
+            .end => child.x = if (width > child.width) width - child.width else 0,
+            .stretch => {
+                child.x = 0;
+                child.width = width;
+            },
+        }
+
+        current_y += child.height;
+        final_height += child.height;
+    }
+
+    return Size{
+        .width = width,
+        .height = final_height,
+    };
+}
+
+fn layoutRowImpl(row: *Row, constraints: BoxConstraints) Size {
+    const total_width = constraints.max_width orelse 0;
+    var height: u16 = 0;
+
+    // Pass 1: Measure intrinsic children (text) and count proportional children
+    var intrinsic_width: u16 = 0;
+    var nil_count: u16 = 0;
+
+    for (row.children) |*child| {
+        const is_intrinsic = child.ratio == null and child.kind == .text;
+        if (is_intrinsic) {
+            const remaining = if (total_width > intrinsic_width) total_width - intrinsic_width else 0;
+            const child_constraints: BoxConstraints = .{
+                .min_width = 0,
+                .max_width = remaining,
+                .min_height = 0,
+                .max_height = constraints.max_height,
+            };
+            const child_size = child.layout(child_constraints);
+            child.height = child_size.height;
+            child.width = child_size.width;
+            intrinsic_width += child_size.width;
+            if (child_size.height > height) height = child_size.height;
+        } else if (child.ratio == null) {
+            nil_count += 1;
+        }
+    }
+
+    // Available space for ratio/nil children
+    const available = if (total_width > intrinsic_width) total_width - intrinsic_width else 0;
+
+    // Pass 2: Allocate ratio children
+    var used_by_ratio: u16 = 0;
+    for (row.children) |*child| {
+        if (child.ratio) |r| {
+            const share: u16 = @intFromFloat(@as(f32, @floatFromInt(available)) * r);
+            const child_constraints: BoxConstraints = .{
+                .min_width = share,
+                .max_width = share,
+                .min_height = 0,
+                .max_height = constraints.max_height,
+            };
+            const child_size = child.layout(child_constraints);
+            child.height = child_size.height;
+            child.width = child_size.width;
+            used_by_ratio += share;
+            if (child_size.height > height) height = child_size.height;
+        }
+    }
+
+    // Pass 3: Split remaining among nil-ratio non-intrinsic children equally
+    const remaining_for_nil = if (available > used_by_ratio) available - used_by_ratio else 0;
+    if (nil_count > 0 and remaining_for_nil > 0) {
+        var remaining = remaining_for_nil;
+        var count = nil_count;
+        for (row.children) |*child| {
+            const is_intrinsic = child.kind == .text;
+            if (child.ratio == null and !is_intrinsic) {
+                const share = remaining / count;
+                remaining -= share;
+                count -= 1;
+
+                const child_constraints: BoxConstraints = .{
+                    .min_width = share,
+                    .max_width = share,
+                    .min_height = 0,
+                    .max_height = constraints.max_height,
+                };
+                const child_size = child.layout(child_constraints);
+                child.height = child_size.height;
+                child.width = child_size.width;
+                if (child_size.height > height) height = child_size.height;
+            }
+        }
+    }
+
+    // Final pass: Position children
+    var current_x: u16 = 0;
+    var final_width: u16 = 0;
+    for (row.children) |*child| {
+        child.x = current_x;
+
+        switch (row.cross_axis_align) {
+            .start => child.y = 0,
+            .center => child.y = if (height > child.height) (height - child.height) / 2 else 0,
+            .end => child.y = if (height > child.height) height - child.height else 0,
+            .stretch => {
+                child.y = 0;
+                child.height = height;
+            },
+        }
+
+        current_x += child.width;
+        final_width += child.width;
+    }
+
+    return Size{
+        .width = final_width,
+        .height = height,
+    };
+}
+
+fn layoutTextImpl(text: *Text, constraints: BoxConstraints) Size {
+    // For layout, we need to iterate to calculate height.
+    // But iterator allocates. Since layout is called often, we should probably
+    // try to minimize allocation. However, strict correctness for wrapping requires
+    // the full iteration logic.
+    //
+    // We can use a GPA for layout which is acceptable as layout is usually
+    // per-frame or per-resize.
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    var iter: Text.Iterator = .{
+        .text = text.*,
+        .max_width = constraints.max_width orelse 65535,
+        .allocator = alloc,
+    };
+
+    var max_w: u16 = 0;
+    var height: u16 = 0;
+
+    while (iter.next() catch null) |line| {
+        defer alloc.free(line.segments);
+        if (line.width > max_w) max_w = line.width;
+        height += 1;
+    }
+
+    return Size{
+        .width = max_w,
+        .height = height,
+    };
+}
+
+fn layoutStackImpl(stack: *Stack, constraints: BoxConstraints) Size {
+    var max_width: u16 = 0;
+    var max_height: u16 = 0;
+
+    for (stack.children) |*child| {
+        const child_size = child.layout(constraints);
+        child.x = 0;
+        child.y = 0;
+        if (child_size.width > max_width) max_width = child_size.width;
+        if (child_size.height > max_height) max_height = child_size.height;
+    }
+
+    return Size{
+        .width = max_width,
+        .height = max_height,
+    };
+}
+
+fn layoutPositionedImpl(pos: *Positioned, constraints: BoxConstraints) Size {
+    const child_size = pos.child.layout(constraints);
+
+    const container_width = constraints.max_width orelse child_size.width;
+    const container_height = constraints.max_height orelse child_size.height;
+
+    const anchor_x: u16 = switch (pos.anchor) {
+        .top_left, .center_left, .bottom_left => 0,
+        .top_center, .center, .bottom_center => if (container_width > child_size.width) (container_width - child_size.width) / 2 else 0,
+        .top_right, .center_right, .bottom_right => if (container_width > child_size.width) container_width - child_size.width else 0,
+    };
+    const anchor_y: u16 = switch (pos.anchor) {
+        .top_left, .top_center, .top_right => 0,
+        .center_left, .center, .center_right => if (container_height > child_size.height) (container_height - child_size.height) / 2 else 0,
+        .bottom_left, .bottom_center, .bottom_right => if (container_height > child_size.height) container_height - child_size.height else 0,
+    };
+
+    pos.child.x = pos.x orelse anchor_x;
+    pos.child.y = pos.y orelse anchor_y;
+    pos.child.width = child_size.width;
+    pos.child.height = child_size.height;
+
+    return Size{
+        .width = pos.child.x + child_size.width,
+        .height = pos.child.y + child_size.height,
+    };
 }

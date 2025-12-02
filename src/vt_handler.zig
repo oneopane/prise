@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const ghostty_vt = @import("ghostty-vt");
+const main = @import("main.zig");
 
 const log = std.log.scoped(.vt_handler);
 
@@ -248,10 +249,11 @@ pub const Handler = struct {
 
             .report_pwd => try self.handleReportPwd(value.url),
 
+            .xtversion => try self.handleXtversion(),
+
             .bell,
             .enquiry,
             .size_report,
-            .xtversion,
             .device_status,
             .show_desktop_notification,
             .progress_report,
@@ -330,6 +332,13 @@ pub const Handler = struct {
         const flags = self.terminal.screens.active.kitty_keyboard.current();
         var buf: [32]u8 = undefined;
         const resp = std.fmt.bufPrint(&buf, "\x1b[?{}u", .{flags.int()}) catch return;
+        try self.write(resp);
+    }
+
+    /// Handle XTVERSION query by reporting prise version.
+    fn handleXtversion(self: *Handler) !void {
+        var buf: [64]u8 = undefined;
+        const resp = std.fmt.bufPrint(&buf, "\x1bP>|prise {s}\x1b\\", .{main.version}) catch return;
         try self.write(resp);
     }
 

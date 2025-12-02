@@ -2494,6 +2494,8 @@ const Server = struct {
     }
 
     fn renderFrame(self: *Server, pty_instance: *Pty) void {
+        if (pty_instance.clients.items.len == 0) return;
+
         const msg = buildRedrawMessageFromPty(
             self.allocator,
             pty_instance,

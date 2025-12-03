@@ -32,6 +32,7 @@ local prise = require("prise")
 ---@field active_tab integer
 ---@field next_tab_id integer
 ---@field focused_id? number
+---@field zoomed_pane_id? number
 ---@field pending_command boolean
 ---@field timer? userdata
 ---@field pending_split? { direction: "row"|"col" }
@@ -77,6 +78,7 @@ local state = {
     active_tab = 1,
     next_tab_id = 1,
     focused_id = nil,
+    zoomed_pane_id = nil,
     app_focused = true,
     pending_command = false,
     timer = nil,
@@ -365,6 +367,9 @@ local function set_active_tab_index(new_index)
         return
     end
 
+    -- Clear zoom when switching tabs
+    state.zoomed_pane_id = nil
+
     local old_tab = state.tabs[state.active_tab]
     local old_focused = state.focused_id
 
@@ -458,6 +463,11 @@ local function remove_pane_by_id(id)
     local tab_idx, tab = find_tab_for_pane(id)
     if not tab then
         return false
+    end
+
+    -- Clear zoom if the zoomed pane is being removed
+    if state.zoomed_pane_id == id then
+        state.zoomed_pane_id = nil
     end
 
     local new_root, next_focus = remove_pane_recursive(tab.root, id)
@@ -844,6 +854,17 @@ local commands = {
         end,
     },
     {
+        name = "Toggle Zoom",
+        action = function()
+            if state.zoomed_pane_id then
+                state.zoomed_pane_id = nil
+            elseif state.focused_id then
+                state.zoomed_pane_id = state.focused_id
+            end
+            prise.request_frame()
+        end,
+    },
+    {
         name = "New Tab",
         action = function()
             local pty = get_focused_pty()
@@ -1149,6 +1170,14 @@ function M.update(event)
             elseif k == "q" then
                 -- Quit
                 prise.quit()
+                handled = true
+            elseif k == "z" then
+                -- Toggle zoom
+                if state.zoomed_pane_id then
+                    state.zoomed_pane_id = nil
+                elseif state.focused_id then
+                    state.zoomed_pane_id = state.focused_id
+                end
                 handled = true
             elseif k == "Enter" or k == "\r" or k == "\n" then
                 local pty = get_focused_pty()
@@ -1490,6 +1519,13 @@ local function build_status_bar()
         { text = pane_info, style = { bg = THEME.bg3, fg = THEME.fg_dim } },
     }
 
+    -- Add zoom indicator if zoomed
+    if state.zoomed_pane_id then
+        table.insert(segments, { text = POWERLINE_SYMBOLS.right_solid, style = { fg = THEME.bg3, bg = THEME.yellow } })
+        table.insert(segments, { text = " ZOOM ", style = { bg = THEME.yellow, fg = THEME.fg_dark, bold = true } })
+        table.insert(segments, { text = POWERLINE_SYMBOLS.right_solid, style = { fg = THEME.yellow, bg = THEME.bg3 } })
+    end
+
     -- Add tab info if applicable
     if #state.tabs > 1 then
         table.insert(segments, { text = POWERLINE_SYMBOLS.right_solid, style = { fg = THEME.bg3, bg = THEME.bg4 } })
@@ -1515,7 +1551,25 @@ function M.view()
     local palette = build_palette()
     local tab_bar = build_tab_bar()
     prise.log.debug("view: palette.visible=" .. tostring(state.palette.visible))
-    local content = render_node(root, state.palette.visible)
+
+    -- When zoomed, render only the zoomed pane
+    local content
+    if state.zoomed_pane_id then
+        local path = find_node_path(root, state.zoomed_pane_id)
+        if path then
+            local pane = path[#path]
+            content = prise.Terminal({
+                pty = pane.pty,
+                focus = not state.palette.visible,
+            })
+        else
+            state.zoomed_pane_id = nil
+            content = render_node(root, state.palette.visible)
+        end
+    else
+        content = render_node(root, state.palette.visible)
+    end
+
     local status_bar = build_status_bar()
 
     local main_children = {}

@@ -1429,32 +1429,20 @@ local function build_tab_bar()
         return nil
     end
 
-    local items = {}
+    local segments = {}
     for i, tab in ipairs(state.tabs) do
         local is_active = (i == state.active_tab)
-        local label = tab.title or ("Tab " .. i)
+        local label = " " .. (tab.title or tostring(i)) .. " "
 
-        local style = is_active and { bg = THEME.mode_normal, fg = THEME.fg_dark }
-            or { bg = THEME.bg2, fg = THEME.fg_bright }
+        local style = is_active and { bg = THEME.accent, fg = THEME.fg_dark } or { bg = THEME.bg2, fg = THEME.fg_dim }
 
-        table.insert(
-            items,
-            prise.Box({
-                border = "none",
-                style = style,
-                child = prise.Padding({
-                    left = 1,
-                    right = 1,
-                    child = prise.Text(label),
-                }),
-            })
-        )
+        table.insert(segments, { text = label, style = style })
     end
 
-    return prise.Row({
-        children = items,
-        cross_axis_align = "stretch",
-    })
+    -- Cap off with default background so last tab doesn't fill the row
+    table.insert(segments, { text = " ", style = { bg = THEME.bg1 } })
+
+    return prise.Text(segments)
 end
 
 ---Build the powerline-style status bar

@@ -16,7 +16,8 @@ const log = std.log.scoped(.ui);
 const logger = std.log.scoped(.lua);
 
 const prise_module = @embedFile("lua/prise.lua");
-const default_ui = @embedFile("lua/default.lua");
+const default_ui_module = @embedFile("lua/default.lua");
+const fallback_init = "return require('prise').default()";
 
 const TimerContext = struct {
     ui: *UI,
@@ -102,6 +103,8 @@ pub const UI = struct {
         _ = lua.getField(-1, "preload");
         lua.pushFunction(ziglua.wrap(loadPriseModule));
         lua.setField(-2, "prise");
+        lua.pushFunction(ziglua.wrap(loadDefaultUiModule));
+        lua.setField(-2, "prise_default_ui");
         lua.pop(2);
 
         // Try to load ~/.config/prise/init.lua
@@ -118,8 +121,9 @@ pub const UI = struct {
         };
 
         if (use_default) {
-            lua.doString(default_ui) catch |err| {
-                log.err("Failed to load default UI: {}", .{err});
+            lua.doString(fallback_init) catch {
+                const msg = lua.toString(-1) catch "unknown error";
+                log.err("Failed to load default UI: {s}", .{msg});
                 return error.DefaultUIFailed;
             };
         } else {
@@ -257,6 +261,14 @@ pub const UI = struct {
         return self.allocator.dupe(u8, AMORY_NAMES[0]);
     }
 
+    fn loadDefaultUiModule(lua: *ziglua.Lua) i32 {
+        lua.doString(default_ui_module) catch {
+            lua.pushNil();
+            return 1;
+        };
+        return 1;
+    }
+
     fn loadPriseModule(lua: *ziglua.Lua) i32 {
         lua.doString(prise_module) catch {
             lua.pushNil();
@@ -350,9 +362,7 @@ pub const UI = struct {
         lua.pop(1); // pop ui ptr
 
         if (ui.spawn_callback) |cb| {
-            if (lua.typeOf(1) != .table) {
-                lua.raiseErrorStr("spawn options must be a table", .{});
-            }
+            lua.checkType(1, .table);
 
             var opts: SpawnOptions = .{
                 .rows = 24,

@@ -53,26 +53,92 @@ local POWERLINE_SYMBOLS = {
     left_thin = "",
 }
 
--- Color theme (Catppuccin Mocha inspired)
-local THEME = {
-    -- Status bar backgrounds (left to right gradient)
-    mode_normal = "#89b4fa", -- Blue - normal mode
-    mode_command = "#f38ba8", -- Pink - command mode
-    bg1 = "#1e1e2e", -- Darkest (mode section)
-    bg2 = "#313244", -- Dark (title section)
-    bg3 = "#45475a", -- Medium (info section)
-    bg4 = "#585b70", -- Lighter (right sections)
+---@class PriseTheme
+---@field mode_normal? string Color for normal mode indicator
+---@field mode_command? string Color for command mode indicator
+---@field bg1? string Darkest background
+---@field bg2? string Dark background
+---@field bg3? string Medium background
+---@field bg4? string Lighter background
+---@field fg_bright? string Main text color
+---@field fg_dim? string Secondary text color
+---@field fg_dark? string Dark text (on light backgrounds)
+---@field accent? string Accent color
+---@field green? string Success/connected color
+---@field yellow? string Warning color
 
-    -- Text colors
-    fg_bright = "#cdd6f4", -- Main text
-    fg_dim = "#a6adc8", -- Secondary text
-    fg_dark = "#1e1e2e", -- Dark text on light bg
+---@class PriseStatusBarConfig
+---@field enabled? boolean Show the status bar (default: true)
 
-    -- Accent colors
-    accent = "#89b4fa", -- Blue accent
-    green = "#a6e3a1", -- Success/connected
-    yellow = "#f9e2af", -- Warning
+---@class PriseTabBarConfig
+---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
+
+---@class PriseKeybind
+---@field key string The key (e.g., "k", "p", "Enter")
+---@field ctrl? boolean Require ctrl modifier
+---@field alt? boolean Require alt modifier
+---@field shift? boolean Require shift modifier
+---@field super? boolean Require super/cmd modifier
+
+---@class PriseKeybinds
+---@field leader? PriseKeybind Key to enter command mode (default: super+k)
+---@field palette? PriseKeybind Key to open command palette (default: super+p)
+
+---@class PriseConfig
+---@field theme? PriseTheme Color theme options
+---@field status_bar? PriseStatusBarConfig Status bar options
+---@field tab_bar? PriseTabBarConfig Tab bar options
+---@field keybinds? PriseKeybinds Keybind configuration
+
+-- Default configuration
+---@type PriseConfig
+local config = {
+    theme = {
+        -- Status bar backgrounds (left to right gradient)
+        mode_normal = "#89b4fa", -- Blue - normal mode
+        mode_command = "#f38ba8", -- Pink - command mode
+        bg1 = "#1e1e2e", -- Darkest (mode section)
+        bg2 = "#313244", -- Dark (title section)
+        bg3 = "#45475a", -- Medium (info section)
+        bg4 = "#585b70", -- Lighter (right sections)
+
+        -- Text colors
+        fg_bright = "#cdd6f4", -- Main text
+        fg_dim = "#a6adc8", -- Secondary text
+        fg_dark = "#1e1e2e", -- Dark text on light bg
+
+        -- Accent colors
+        accent = "#89b4fa", -- Blue accent
+        green = "#a6e3a1", -- Success/connected
+        yellow = "#f9e2af", -- Warning
+    },
+    status_bar = {
+        enabled = true,
+    },
+    tab_bar = {
+        show_single_tab = false,
+    },
+    keybinds = {
+        leader = { key = "k", super = true },
+        palette = { key = "p", super = true },
+    },
 }
+
+---Deep merge tables (source into target)
+---@param target table
+---@param source table
+local function deep_merge(target, source)
+    for k, v in pairs(source) do
+        if type(v) == "table" and type(target[k]) == "table" then
+            deep_merge(target[k], v)
+        else
+            target[k] = v
+        end
+    end
+end
+
+-- Convenience alias for theme access
+local THEME = config.theme
 
 local state = {
     tabs = {},
@@ -101,7 +167,38 @@ local state = {
 
 local M = {}
 
+---Configure the default UI
+---@param opts? PriseConfig Configuration options to merge
+function M.setup(opts)
+    if opts then
+        deep_merge(config, opts)
+    end
+end
+
 local RESIZE_STEP = 0.05 -- 5% step for keyboard resize
+
+---Check if a key event matches a keybind
+---@param event_data table The event.data from a key_press event
+---@param bind PriseKeybind The keybind to match against
+---@return boolean
+local function matches_keybind(event_data, bind)
+    if event_data.key ~= bind.key then
+        return false
+    end
+    if (bind.ctrl or false) ~= (event_data.ctrl or false) then
+        return false
+    end
+    if (bind.alt or false) ~= (event_data.alt or false) then
+        return false
+    end
+    if (bind.shift or false) ~= (event_data.shift or false) then
+        return false
+    end
+    if (bind.super or false) ~= (event_data.super or false) then
+        return false
+    end
+    return true
+end
 
 -- --- Helpers ---
 
@@ -1089,8 +1186,8 @@ function M.update(event)
             return
         end
 
-        -- Super+p to open command palette
-        if event.data.key == "p" and event.data.super then
+        -- Open command palette
+        if matches_keybind(event.data, config.keybinds.palette) then
             open_palette()
             return
         end
@@ -1242,8 +1339,8 @@ function M.update(event)
             return
         end
 
-        -- Super+k to enter command mode
-        if event.data.key == "k" and event.data.super then
+        -- Enter command mode (leader key)
+        if matches_keybind(event.data, config.keybinds.leader) then
             state.pending_command = true
             prise.request_frame()
             state.timer = prise.set_timeout(1000, function()
@@ -1541,7 +1638,7 @@ end
 ---Build the tab bar (only shown if more than 1 tab)
 ---@return table?
 local function build_tab_bar()
-    if #state.tabs <= 1 then
+    if not config.tab_bar.show_single_tab and #state.tabs <= 1 then
         state.tab_regions = {}
         return nil
     end
@@ -1678,14 +1775,16 @@ function M.view()
         content = render_node(root, state.palette.visible)
     end
 
-    local status_bar = build_status_bar()
+    local status_bar = config.status_bar.enabled and build_status_bar() or nil
 
     local main_children = {}
     if tab_bar then
         table.insert(main_children, tab_bar)
     end
     table.insert(main_children, content)
-    table.insert(main_children, status_bar)
+    if status_bar then
+        table.insert(main_children, status_bar)
+    end
 
     local main_ui = prise.Column({
         cross_axis_align = "stretch",

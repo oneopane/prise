@@ -274,7 +274,18 @@ fn runClient(allocator: std.mem.Allocator, socket_path: []const u8, attach_sessi
     var loop = try io.Loop.init(allocator);
     defer loop.deinit();
 
-    var app = try client.App.init(allocator);
+    var app = client.App.init(allocator) catch |err| {
+        var buf: [512]u8 = undefined;
+        var stderr = std.fs.File.stderr().writer(&buf);
+        defer stderr.interface.flush() catch {};
+        switch (err) {
+            error.InitLuaMustReturnTable => stderr.interface.print("error: init.lua must return a UI table\n  example: return require('prise').default()\n", .{}) catch {},
+            error.InitLuaFailed => stderr.interface.print("error: failed to load init.lua (check logs for details)\n", .{}) catch {},
+            error.DefaultUIFailed => stderr.interface.print("error: failed to load default UI\n", .{}) catch {},
+            else => {},
+        }
+        return err;
+    };
     defer app.deinit();
 
     app.socket_path = socket_path;

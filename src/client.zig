@@ -701,7 +701,11 @@ pub const App = struct {
         log.info("Vaxis initialized", .{});
 
         // Initialize Lua UI
-        app.ui = try UI.init(allocator);
+        app.ui = UI.init(allocator) catch |err| {
+            app.vx.deinit(allocator, app.tty.writer());
+            app.tty.deinit();
+            return err;
+        };
         log.info("Lua UI initialized", .{});
 
         // Create pipe for TTY thread -> Main thread communication

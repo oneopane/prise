@@ -56,7 +56,24 @@
 ---@field left? number
 ---@field right? number
 
+---@class PriseUI
+---@field update fun(event: table) Handle an input event
+---@field view fun(): table Return the widget tree to render
+---@field get_state? fun(cwd_lookup: fun(id: number): string?): table Serialize UI state for persistence
+---@field set_state? fun(saved: table?, pty_lookup: fun(id: number): userdata?) Restore UI state
+---@field setup? fun(opts: table?) Configure the UI (optional)
+
 local M = {}
+
+---Load the default UI module
+---@return PriseUI
+function M.default()
+    local ok, result = pcall(require, "prise_default_ui")
+    if not ok then
+        error("Failed to load default UI: " .. tostring(result))
+    end
+    return result
+end
 
 ---Create a terminal widget that displays a PTY
 ---@param opts TerminalOpts

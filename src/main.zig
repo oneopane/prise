@@ -151,10 +151,14 @@ fn printHelp() !void {
 }
 
 fn printSessionHelp() !void {
+    try printSessionHelpTo(std.fs.File.stdout());
+}
+
+fn printSessionHelpTo(file: std.fs.File) !void {
     var buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
-    defer stdout.interface.flush() catch {};
-    try stdout.interface.print(
+    var writer = file.writer(&buf);
+    defer writer.interface.flush() catch {};
+    try writer.interface.print(
         \\prise session - Manage sessions
         \\
         \\Usage: prise session <command> [args]
@@ -188,34 +192,42 @@ fn handleSessionCommand(allocator: std.mem.Allocator, args: *std.process.ArgIter
         return null;
     } else if (std.mem.eql(u8, subcmd, "rename")) {
         const old_name = args.next() orelse {
-            log.err("Usage: prise session rename <old-name> <new-name>", .{});
+            std.fs.File.stderr().writeAll("Missing session name. Usage: prise session rename <old-name> <new-name>\n\nAvailable sessions:\n") catch {};
+            try listSessionsTo(allocator, std.fs.File.stderr());
             return error.MissingArgument;
         };
         const new_name = args.next() orelse {
-            log.err("Usage: prise session rename <old-name> <new-name>", .{});
+            std.fs.File.stderr().writeAll("Missing new session name. Usage: prise session rename <old-name> <new-name>\n") catch {};
             return error.MissingArgument;
         };
         try renameSession(allocator, old_name, new_name);
         return null;
     } else if (std.mem.eql(u8, subcmd, "delete")) {
         const name = args.next() orelse {
-            std.fs.File.stderr().writeAll("Missing session name. Usage: prise session delete <name>\n") catch {};
+            std.fs.File.stderr().writeAll("Missing session name. Usage: prise session delete <name>\n\nAvailable sessions:\n") catch {};
+            try listSessionsTo(allocator, std.fs.File.stderr());
             return error.MissingArgument;
         };
         try deleteSession(allocator, name);
         return null;
     } else {
-        log.err("Unknown session command: {s}", .{subcmd});
-        try printSessionHelp();
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Unknown session command: {s}\n\n", .{subcmd}) catch return error.UnknownCommand;
+        std.fs.File.stderr().writeAll(msg) catch {};
+        try printSessionHelpTo(std.fs.File.stderr());
         return error.UnknownCommand;
     }
 }
 
 fn printPtyHelp() !void {
+    try printPtyHelpTo(std.fs.File.stdout());
+}
+
+fn printPtyHelpTo(file: std.fs.File) !void {
     var buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
-    defer stdout.interface.flush() catch {};
-    try stdout.interface.print(
+    var writer = file.writer(&buf);
+    defer writer.interface.flush() catch {};
+    try writer.interface.print(
         \\prise pty - Manage PTYs
         \\
         \\Usage: prise pty <command> [args]
@@ -244,18 +256,22 @@ fn handlePtyCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator
         return null;
     } else if (std.mem.eql(u8, subcmd, "kill")) {
         const id_str = args.next() orelse {
-            log.err("Missing PTY ID. Usage: prise pty kill <id>", .{});
+            std.fs.File.stderr().writeAll("Missing PTY ID. Usage: prise pty kill <id>\n\nUse 'prise pty list' to see available PTYs.\n") catch {};
             return error.MissingArgument;
         };
         const pty_id = std.fmt.parseInt(u32, id_str, 10) catch {
-            log.err("Invalid PTY ID: {s}", .{id_str});
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "Invalid PTY ID: {s}\n", .{id_str}) catch return error.InvalidArgument;
+            std.fs.File.stderr().writeAll(msg) catch {};
             return error.InvalidArgument;
         };
         try killPty(allocator, socket_path, pty_id);
         return null;
     } else {
-        log.err("Unknown pty command: {s}", .{subcmd});
-        try printPtyHelp();
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Unknown pty command: {s}\n\n", .{subcmd}) catch return error.UnknownCommand;
+        std.fs.File.stderr().writeAll(msg) catch {};
+        try printPtyHelpTo(std.fs.File.stderr());
         return error.UnknownCommand;
     }
 }
@@ -321,17 +337,17 @@ fn getSessionsDir(allocator: std.mem.Allocator) !struct { dir: std.fs.Dir, path:
 }
 
 fn listSessions(allocator: std.mem.Allocator) !void {
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buf);
-    defer stdout.interface.flush() catch {};
+    try listSessionsTo(allocator, std.fs.File.stdout());
+}
 
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr = std.fs.File.stderr().writer(&stderr_buf);
-    defer stderr.interface.flush() catch {};
+fn listSessionsTo(allocator: std.mem.Allocator, file: std.fs.File) !void {
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(&buf);
+    defer writer.interface.flush() catch {};
 
     const result = getSessionsDir(allocator) catch |err| {
         if (err == error.NoSessionsFound) {
-            try stderr.interface.print("No sessions found.\n", .{});
+            try writer.interface.print("No sessions found.\n", .{});
             return;
         }
         return err;
@@ -348,12 +364,12 @@ fn listSessions(allocator: std.mem.Allocator) !void {
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
         const name_without_ext = entry.name[0 .. entry.name.len - 5];
-        try stdout.interface.print("{s}\n", .{name_without_ext});
+        try writer.interface.print("{s}\n", .{name_without_ext});
         count += 1;
     }
 
     if (count == 0) {
-        try stderr.interface.print("No sessions found.\n", .{});
+        try writer.interface.print("No sessions found.\n", .{});
     }
 }
 

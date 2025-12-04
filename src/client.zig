@@ -2386,6 +2386,11 @@ pub const App = struct {
                                 };
                                 // Delete session file when last PTY exits (if quit wasn't already called)
                                 if (app.surfaces.count() == 0 and !app.state.should_quit) {
+                                    // Cancel autosave timer to prevent it from recreating the file
+                                    if (app.autosave_timer) |*task| {
+                                        if (app.io_loop) |loop| task.cancel(loop) catch {};
+                                        app.autosave_timer = null;
+                                    }
                                     app.deleteCurrentSession();
                                 }
                             },

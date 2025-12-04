@@ -24,7 +24,7 @@ using a third-party client.
 
 Prise is built on a solid foundation of `libghostty`, `libvaxis`, and Lua. While these tools provide an excellent starting point, they do not guarantee success—it is still entirely possible to build bad software with good tools. We believe that **agentic coding**—leveraging AI agents to amplify engineering capabilities—is capable of consistently producing the quality software we demand.
 
-Prise is an agentic coded project. Contributions are welcome, but preference is given to AI-developed code.
+Prise is an agentic coded project. Contributions are welcome. Show me your vibes.
 
 *   Sharing of AI conversation threads is preferred when submitting contributions, even if those threads did not directly result in the final Pull Request.
 *   If you cannot afford paid AI tools, check out [Amp's free mode](https://ampcode.com).

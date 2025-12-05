@@ -108,7 +108,7 @@ pub fn build(b: *std.Build) void {
 
     const check_fmt = b.addSystemCommand(&.{
         "sh", "-c",
-        \\zig fmt --check src build.zig && stylua --check src/lua || {
+        \\zig fmt --check src tools build.zig && stylua --check src/lua || {
         \\  echo ""; echo "Format check failed. Run 'zig build fmt' to fix."; exit 1;
         \\}
         ,
@@ -118,13 +118,33 @@ pub fn build(b: *std.Build) void {
     const fmt_step = b.step("fmt", "Format Zig and Lua files");
 
     const fmt_zig = b.addFmt(.{
-        .paths = &.{ "src", "build.zig" },
+        .paths = &.{ "src", "build.zig", "tools" },
         .check = false,
     });
     fmt_step.dependOn(&fmt_zig.step);
 
     const stylua = b.addSystemCommand(&.{ "stylua", "src/lua" });
     fmt_step.dependOn(&stylua.step);
+
+    // mdman - markdown to man page converter
+    const mdman_mod = b.createModule(.{
+        .root_source_file = b.path("tools/mdman/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const mdman = b.addExecutable(.{
+        .name = "mdman",
+        .root_module = mdman_mod,
+    });
+
+    const mdman_step = b.step("mdman", "Build the mdman tool");
+    mdman_step.dependOn(&b.addInstallArtifact(mdman, .{}).step);
+
+    const mdman_tests = b.addTest(.{
+        .root_module = mdman_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(mdman_tests).step);
 
     const setup_step = b.step("setup", "Setup development environment (install pre-commit hook)");
 

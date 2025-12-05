@@ -250,7 +250,7 @@ pub fn build(b: *std.Build) void {
     enable_service_step.dependOn(b.getInstallStep());
 }
 
-const version_base = "0.0.0";
+const version_base = "0.1.0";
 
 fn getVersion(b: *std.Build) []const u8 {
     var code: u8 = undefined;

@@ -2185,23 +2185,30 @@ fn layoutTextImpl(text: *Text, constraints: BoxConstraints) Size {
     const alloc = gpa.allocator();
     defer _ = gpa.deinit();
 
+    const max_width = constraints.max_width orelse 65535;
+
     var iter: Text.Iterator = .{
         .text = text.*,
-        .max_width = constraints.max_width orelse 65535,
+        .max_width = max_width,
         .allocator = alloc,
     };
 
-    var max_w: u16 = 0;
+    var intrinsic_width: u16 = 0;
     var height: u16 = 0;
 
     while (iter.next() catch null) |line| {
         defer alloc.free(line.segments);
-        if (line.width > max_w) max_w = line.width;
+        if (line.width > intrinsic_width) intrinsic_width = line.width;
         height += 1;
     }
 
+    const width: u16 = switch (text.@"align") {
+        .left => intrinsic_width,
+        .center, .right => if (constraints.max_width) |mw| mw else intrinsic_width,
+    };
+
     return .{
-        .width = max_w,
+        .width = width,
         .height = height,
     };
 }
@@ -2548,7 +2555,7 @@ test "render Row - side by side text" {
 // Text Layout Tests
 // ============================================================================
 
-test "layout Text - alignment does not affect size" {
+test "layout Text - alignment affects width for center and right" {
     var spans = [_]Text.Span{
         .{ .text = "Hello", .style = .{} },
     };
@@ -2571,8 +2578,8 @@ test "layout Text - alignment does not affect size" {
 
     try std.testing.expectEqual(@as(u16, 5), left_size.width);
     try std.testing.expectEqual(@as(u16, 1), left_size.height);
-    try std.testing.expectEqual(left_size, center_size);
-    try std.testing.expectEqual(left_size, right_size);
+    try std.testing.expectEqual(@as(u16, 20), center_size.width);
+    try std.testing.expectEqual(@as(u16, 20), right_size.width);
 }
 
 test "render Text - left alignment" {
@@ -2946,4 +2953,86 @@ test "layout Text - no wrap reports full width single line" {
 
     try std.testing.expectEqual(@as(u16, 1), size.height);
     try std.testing.expectEqual(@as(u16, 19), size.width);
+}
+
+test "layout Text - flex in Column with ratio uses intrinsic height for positioning" {
+    var spans1 = [_]Text.Span{.{ .text = "Top", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "Bottom", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .ratio = 0.5, .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .ratio = 0.5, .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var col: Widget = .{
+        .kind = .{ .column = .{ .children = &children } },
+    };
+
+    _ = col.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 0), children[0].y);
+    try std.testing.expectEqual(@as(u16, 1), children[1].y);
+    try std.testing.expectEqual(@as(u16, 1), children[0].height);
+    try std.testing.expectEqual(@as(u16, 1), children[1].height);
+}
+
+test "layout Text - flex in Row with ratio uses intrinsic width for positioning" {
+    var spans1 = [_]Text.Span{.{ .text = "Left", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "Right", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .ratio = 0.5, .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .ratio = 0.5, .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var row: Widget = .{
+        .kind = .{ .row = .{ .children = &children } },
+    };
+
+    _ = row.layout(boundsConstraints(20, 5));
+
+    try std.testing.expectEqual(@as(u16, 0), children[0].x);
+    try std.testing.expectEqual(@as(u16, 4), children[1].x);
+    try std.testing.expectEqual(@as(u16, 4), children[0].width);
+    try std.testing.expectEqual(@as(u16, 5), children[1].width);
+}
+
+test "layout Text - flex in Row with ratio constrains word wrap" {
+    var spans1 = [_]Text.Span{.{ .text = "Hello World", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "Test", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .ratio = 0.5, .kind = .{ .text = .{ .spans = &spans1, .wrap = .word } } },
+        .{ .ratio = 0.5, .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var row: Widget = .{
+        .kind = .{ .row = .{ .children = &children } },
+    };
+
+    _ = row.layout(boundsConstraints(16, 5));
+
+    try std.testing.expectEqual(@as(u16, 2), children[0].height);
+    try std.testing.expectEqual(@as(u16, 6), children[0].width);
+}
+
+test "layout Text - flex in Row with center align fills allocated width" {
+    var spans1 = [_]Text.Span{.{ .text = "Hi", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "There", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .ratio = 0.5, .kind = .{ .text = .{ .spans = &spans1, .@"align" = .center } } },
+        .{ .ratio = 0.5, .kind = .{ .text = .{ .spans = &spans2, .@"align" = .center } } },
+    };
+
+    var row: Widget = .{
+        .kind = .{ .row = .{ .children = &children } },
+    };
+
+    _ = row.layout(boundsConstraints(20, 5));
+
+    try std.testing.expectEqual(@as(u16, 10), children[0].width);
+    try std.testing.expectEqual(@as(u16, 10), children[1].width);
+    try std.testing.expectEqual(@as(u16, 0), children[0].x);
+    try std.testing.expectEqual(@as(u16, 10), children[1].x);
 }

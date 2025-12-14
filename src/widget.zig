@@ -3036,3 +3036,89 @@ test "layout Text - flex in Row with center align fills allocated width" {
     try std.testing.expectEqual(@as(u16, 0), children[0].x);
     try std.testing.expectEqual(@as(u16, 10), children[1].x);
 }
+
+test "layout Text - empty spans array returns zero dimensions" {
+    var spans = [_]Text.Span{};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 0), size.width);
+    try std.testing.expectEqual(@as(u16, 0), size.height);
+}
+
+test "render Text - empty spans array renders without crash" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 5));
+
+    var screen = try tui_test.createScreen(allocator, 10, 5);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 10, 5);
+    defer allocator.free(ascii);
+
+    const expected =
+        \\          
+        \\          
+        \\          
+        \\          
+        \\          
+    ;
+    try tui_test.expectAsciiEqual(expected, ascii);
+}
+
+test "layout Text - single span with empty string returns zero dimensions" {
+    var spans = [_]Text.Span{.{ .text = "", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 0), size.width);
+    try std.testing.expectEqual(@as(u16, 0), size.height);
+}
+
+test "render Text - single span with empty string renders without crash" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 5));
+
+    var screen = try tui_test.createScreen(allocator, 10, 5);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 10, 5);
+    defer allocator.free(ascii);
+
+    const expected =
+        \\          
+        \\          
+        \\          
+        \\          
+        \\          
+    ;
+    try tui_test.expectAsciiEqual(expected, ascii);
+}

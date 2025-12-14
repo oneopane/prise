@@ -2044,6 +2044,12 @@ fn layoutColumnImpl(col: *Column, constraints: BoxConstraints) Size {
         }
     }
 
+    // For end/stretch, use container width if available
+    const cross_width: u16 = switch (col.cross_axis_align) {
+        .start, .center => width,
+        .end, .stretch => constraints.max_width orelse width,
+    };
+
     // Final pass: Position children
     var current_y: u16 = 0;
     var final_height: u16 = 0;
@@ -2054,10 +2060,10 @@ fn layoutColumnImpl(col: *Column, constraints: BoxConstraints) Size {
         switch (col.cross_axis_align) {
             .start => child.x = 0,
             .center => child.x = if (width > child.width) (width - child.width) / 2 else 0,
-            .end => child.x = if (width > child.width) width - child.width else 0,
+            .end => child.x = if (cross_width > child.width) cross_width - child.width else 0,
             .stretch => {
                 child.x = 0;
-                child.width = width;
+                child.width = cross_width;
             },
         }
 
@@ -2066,7 +2072,7 @@ fn layoutColumnImpl(col: *Column, constraints: BoxConstraints) Size {
     }
 
     return .{
-        .width = width,
+        .width = if (col.cross_axis_align == .end or col.cross_axis_align == .stretch) cross_width else width,
         .height = final_height,
     };
 }
@@ -2147,6 +2153,12 @@ fn layoutRowImpl(row: *Row, constraints: BoxConstraints) Size {
         }
     }
 
+    // For end/stretch, use container height if available
+    const cross_height: u16 = switch (row.cross_axis_align) {
+        .start, .center => height,
+        .end, .stretch => constraints.max_height orelse height,
+    };
+
     // Final pass: Position children
     var current_x: u16 = 0;
     var final_width: u16 = 0;
@@ -2156,10 +2168,10 @@ fn layoutRowImpl(row: *Row, constraints: BoxConstraints) Size {
         switch (row.cross_axis_align) {
             .start => child.y = 0,
             .center => child.y = if (height > child.height) (height - child.height) / 2 else 0,
-            .end => child.y = if (height > child.height) height - child.height else 0,
+            .end => child.y = if (cross_height > child.height) cross_height - child.height else 0,
             .stretch => {
                 child.y = 0;
-                child.height = height;
+                child.height = cross_height;
             },
         }
 
@@ -3601,4 +3613,705 @@ test "render Text - span style preservation" {
     // Second span (CD) should have index 2
     try std.testing.expectEqual(@as(u8, 2), cell_c.style.fg.index);
     try std.testing.expectEqual(@as(u8, 2), cell_d.style.fg.index);
+}
+
+// ============================================================================
+// List Widget Layout Tests
+// ============================================================================
+
+test "layout List - basic sizing" {
+    var items = [_]List.Item{
+        .{ .text = "Item 1" },
+        .{ .text = "Item 2" },
+        .{ .text = "Item 3" },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .list = .{ .items = &items } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 20), size.width);
+    try std.testing.expectEqual(@as(u16, 3), size.height);
+}
+
+test "layout List - constrained height" {
+    var items = [_]List.Item{
+        .{ .text = "Item 1" },
+        .{ .text = "Item 2" },
+        .{ .text = "Item 3" },
+        .{ .text = "Item 4" },
+        .{ .text = "Item 5" },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .list = .{ .items = &items } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 3));
+
+    try std.testing.expectEqual(@as(u16, 20), size.width);
+    try std.testing.expectEqual(@as(u16, 3), size.height);
+}
+
+test "layout List - empty" {
+    var items = [_]List.Item{};
+
+    var w: Widget = .{
+        .kind = .{ .list = .{ .items = &items } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 20), size.width);
+    try std.testing.expectEqual(@as(u16, 0), size.height);
+}
+
+test "render List - selection style applied" {
+    const allocator = std.testing.allocator;
+
+    var items = [_]List.Item{
+        .{ .text = "A" },
+        .{ .text = "B" },
+        .{ .text = "C" },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .list = .{
+            .items = &items,
+            .selected = 1,
+            .selected_style = .{ .bg = .{ .index = 4 } },
+        } },
+    };
+
+    _ = w.layout(boundsConstraints(3, 3));
+
+    var screen = try tui_test.createScreen(allocator, 3, 3);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 3, 3);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual(
+        \\A  
+        \\B  
+        \\C  
+    , ascii);
+
+    const cell_b = screen.readCell(0, 1).?;
+    try std.testing.expectEqual(@as(u8, 4), cell_b.style.bg.index);
+}
+
+// ============================================================================
+// Box Widget Layout Tests
+// ============================================================================
+
+test "layout Box - single border sizing" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "Hi", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .box = .{ .child = child, .border = .single } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 4), size.width);
+    try std.testing.expectEqual(@as(u16, 3), size.height);
+}
+
+test "layout Box - no border sizing" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "Hi", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .box = .{ .child = child, .border = .none } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 2), size.width);
+    try std.testing.expectEqual(@as(u16, 1), size.height);
+}
+
+test "render Box - double border style" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "X", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .box = .{ .child = child, .border = .double } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 5));
+
+    var screen = try tui_test.createScreen(allocator, 3, 3);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 3, 3);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual(
+        \\╔═╗
+        \\║X║
+        \\╚═╝
+    , ascii);
+}
+
+// ============================================================================
+// Padding Widget Tests
+// ============================================================================
+
+test "layout Padding - uniform" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "X", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .padding = .{
+            .child = child,
+            .top = 1,
+            .bottom = 1,
+            .left = 2,
+            .right = 2,
+        } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 5), size.width);
+    try std.testing.expectEqual(@as(u16, 3), size.height);
+}
+
+test "layout Padding - asymmetric" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "AB", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .padding = .{
+            .child = child,
+            .top = 0,
+            .bottom = 2,
+            .left = 1,
+            .right = 0,
+        } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 3), size.width);
+    try std.testing.expectEqual(@as(u16, 3), size.height);
+}
+
+test "render Padding - positions child correctly" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "X", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .padding = .{
+            .child = child,
+            .top = 1,
+            .bottom = 1,
+            .left = 2,
+            .right = 2,
+        } },
+    };
+
+    _ = w.layout(boundsConstraints(20, 10));
+
+    var screen = try tui_test.createScreen(allocator, 5, 3);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 5, 3);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual(
+        \\     
+        \\  X  
+        \\     
+    , ascii);
+}
+
+test "render Padding - asymmetric" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "AB", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .padding = .{
+            .child = child,
+            .top = 0,
+            .bottom = 2,
+            .left = 1,
+            .right = 0,
+        } },
+    };
+
+    _ = w.layout(boundsConstraints(20, 10));
+
+    var screen = try tui_test.createScreen(allocator, 3, 3);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 3, 3);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual(
+        \\ AB
+        \\   
+        \\   
+    , ascii);
+}
+
+// ============================================================================
+// Column Widget Tests
+// ============================================================================
+
+test "layout Column - stacks children vertically" {
+    var spans1 = [_]Text.Span{.{ .text = "AAA", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "BB", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .column = .{ .children = &children } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 10));
+
+    try expectRect(&children[0], 0, 0, 3, 1);
+    try expectRect(&children[1], 0, 1, 2, 1);
+}
+
+test "layout Column - cross axis center alignment" {
+    const allocator = std.testing.allocator;
+
+    var spans1 = [_]Text.Span{.{ .text = "AAAA", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "BB", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .column = .{ .children = &children, .cross_axis_align = .center } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 10));
+
+    try std.testing.expectEqual(@as(u16, 0), children[0].x);
+    try std.testing.expectEqual(@as(u16, 1), children[1].x);
+
+    _ = allocator;
+}
+
+test "render Column - cross axis end alignment" {
+    const allocator = std.testing.allocator;
+
+    var spans1 = [_]Text.Span{.{ .text = "AAAA", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "BB", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .column = .{ .children = &children, .cross_axis_align = .end } },
+    };
+
+    _ = w.layout(boundsConstraints(6, 10));
+
+    var screen = try tui_test.createScreen(allocator, 6, 2);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 6, 2);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual(
+        \\  AAAA
+        \\    BB
+    , ascii);
+}
+
+test "layout Column - cross axis stretch alignment" {
+    var spans1 = [_]Text.Span{.{ .text = "A", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "B", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .column = .{ .children = &children, .cross_axis_align = .stretch } },
+    };
+
+    _ = w.layout(boundsConstraints(6, 10));
+
+    try std.testing.expectEqual(@as(u16, 6), children[0].width);
+    try std.testing.expectEqual(@as(u16, 6), children[1].width);
+}
+
+// ============================================================================
+// Row Widget Layout Tests
+// ============================================================================
+
+test "layout Row - places children horizontally" {
+    const allocator = std.testing.allocator;
+
+    var spans1 = [_]Text.Span{.{ .text = "AA", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "BB", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .row = .{ .children = &children } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 5));
+
+    try expectRect(&children[0], 0, 0, 2, 1);
+    try expectRect(&children[1], 2, 0, 2, 1);
+
+    _ = allocator;
+}
+
+test "layout Row - cross axis end alignment" {
+    var spans1 = [_]Text.Span{.{ .text = "A", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "BB", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2, .wrap = .char } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .row = .{ .children = &children, .cross_axis_align = .end } },
+    };
+
+    _ = w.layout(boundsConstraints(2, 5));
+
+    try std.testing.expectEqual(@as(u16, 0), children[0].x);
+    try std.testing.expectEqual(@as(u16, 4), children[0].y);
+    try std.testing.expectEqual(@as(u16, 1), children[1].x);
+    try std.testing.expectEqual(@as(u16, 3), children[1].y);
+    try std.testing.expectEqual(@as(u16, 2), children[1].height);
+}
+
+test "layout Row - cross axis stretch alignment" {
+    var spans1 = [_]Text.Span{.{ .text = "A", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "BBB", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2, .wrap = .char } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .row = .{ .children = &children, .cross_axis_align = .stretch } },
+    };
+
+    _ = w.layout(boundsConstraints(2, 5));
+
+    try std.testing.expectEqual(@as(u16, 5), children[0].height);
+    try std.testing.expectEqual(@as(u16, 5), children[1].height);
+}
+
+// ============================================================================
+// Stack Widget Tests
+// ============================================================================
+
+test "layout Stack - takes max size of children" {
+    const allocator = std.testing.allocator;
+
+    var spans1 = [_]Text.Span{.{ .text = "Short", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "LongerText", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .stack = .{ .children = &children } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 10), size.width);
+    try std.testing.expectEqual(@as(u16, 1), size.height);
+
+    _ = allocator;
+}
+
+test "layout Stack - children at origin" {
+    const allocator = std.testing.allocator;
+
+    var spans1 = [_]Text.Span{.{ .text = "A", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "B", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .stack = .{ .children = &children } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 5));
+
+    try std.testing.expectEqual(@as(u16, 0), children[0].x);
+    try std.testing.expectEqual(@as(u16, 0), children[0].y);
+    try std.testing.expectEqual(@as(u16, 0), children[1].x);
+    try std.testing.expectEqual(@as(u16, 0), children[1].y);
+
+    _ = allocator;
+}
+
+test "render Stack - last child on top" {
+    const allocator = std.testing.allocator;
+
+    var spans1 = [_]Text.Span{.{ .text = "AAA", .style = .{} }};
+    var spans2 = [_]Text.Span{.{ .text = "B", .style = .{} }};
+
+    var children = [_]Widget{
+        .{ .kind = .{ .text = .{ .spans = &spans1 } } },
+        .{ .kind = .{ .text = .{ .spans = &spans2 } } },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .stack = .{ .children = &children } },
+    };
+
+    _ = w.layout(boundsConstraints(5, 1));
+
+    var screen = try tui_test.createScreen(allocator, 5, 1);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 5, 1);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual("BAA  ", ascii);
+}
+
+// ============================================================================
+// Positioned Widget Tests
+// ============================================================================
+
+test "layout Positioned - explicit position" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "X", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .positioned = .{
+            .child = child,
+            .x = 5,
+            .y = 3,
+        } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    try std.testing.expectEqual(@as(u16, 5), child.x);
+    try std.testing.expectEqual(@as(u16, 3), child.y);
+    try std.testing.expectEqual(@as(u16, 6), size.width);
+    try std.testing.expectEqual(@as(u16, 4), size.height);
+}
+
+test "layout Positioned - anchor center" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "XX", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .positioned = .{
+            .child = child,
+            .anchor = .center,
+        } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 5));
+
+    try std.testing.expectEqual(@as(u16, 4), child.x);
+    try std.testing.expectEqual(@as(u16, 2), child.y);
+}
+
+test "layout Positioned - anchor bottom_right" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "Z", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .positioned = .{
+            .child = child,
+            .anchor = .bottom_right,
+        } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 5));
+
+    try std.testing.expectEqual(@as(u16, 9), child.x);
+    try std.testing.expectEqual(@as(u16, 4), child.y);
+}
+
+test "render Positioned - explicit position" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "X", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .positioned = .{
+            .child = child,
+            .x = 2,
+            .y = 1,
+        } },
+    };
+
+    _ = w.layout(boundsConstraints(5, 3));
+
+    var screen = try tui_test.createScreen(allocator, 5, 3);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 5, 3);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual(
+        \\     
+        \\  X  
+        \\     
+    , ascii);
+}
+
+test "render Positioned - anchor center" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "O", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .positioned = .{
+            .child = child,
+            .anchor = .center,
+        } },
+    };
+
+    _ = w.layout(boundsConstraints(5, 3));
+
+    var screen = try tui_test.createScreen(allocator, 5, 3);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 5, 3);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual(
+        \\     
+        \\  O  
+        \\     
+    , ascii);
+}
+
+test "render Positioned - anchor bottom_right" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "Z", .style = .{} }};
+    const child = try allocator.create(Widget);
+    child.* = .{ .kind = .{ .text = .{ .spans = &spans } } };
+    defer allocator.destroy(child);
+
+    var w: Widget = .{
+        .kind = .{ .positioned = .{
+            .child = child,
+            .anchor = .bottom_right,
+        } },
+    };
+
+    _ = w.layout(boundsConstraints(5, 3));
+
+    var screen = try tui_test.createScreen(allocator, 5, 3);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 5, 3);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual(
+        \\     
+        \\     
+        \\    Z
+    , ascii);
 }

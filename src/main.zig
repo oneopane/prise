@@ -757,6 +757,7 @@ test {
     _ = @import("vaxis_helper.zig");
     _ = @import("lua_test.zig");
     _ = @import("key_string.zig");
+    _ = @import("action.zig");
 
     if (builtin.os.tag.isDarwin() or builtin.os.tag.isBSD()) {
         _ = @import("io/kqueue.zig");

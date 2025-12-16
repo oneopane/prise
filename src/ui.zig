@@ -8,6 +8,7 @@ const zeit = @import("zeit");
 const ziglua = @import("zlua");
 
 const io = @import("io.zig");
+const keybind = @import("keybind.zig");
 const lua_event = @import("lua_event.zig");
 const msgpack = @import("msgpack.zig");
 const Surface = @import("Surface.zig");
@@ -407,6 +408,10 @@ pub const UI = struct {
         lua.setField(-2, "get_git_branch");
 
         registerTimerMetatable(lua);
+
+        // Register keybind module
+        keybind.registerKeybindModule(lua);
+        lua.setField(-2, "keybind");
 
         return 1;
     }

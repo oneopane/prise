@@ -56,6 +56,7 @@ local utils = require("utils")
 ---@field rename_tab RenameState
 ---@field screen_cols number
 ---@field screen_rows number
+---@field keybind_matcher? KeybindMatcher
 
 ---@class Command
 ---@field name string
@@ -153,16 +154,9 @@ local POWERLINE_SYMBOLS = {
 ---@class PriseTabBarConfig
 ---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
 
----@class PriseKeybind
----@field key string The key (e.g., "k", "p", "Enter")
----@field ctrl? boolean Require ctrl modifier
----@field alt? boolean Require alt modifier
----@field shift? boolean Require shift modifier
----@field super? boolean Require super/cmd modifier
-
----@class PriseKeybinds
----@field leader? PriseKeybind Key to enter command mode (default: super+k)
----@field palette? PriseKeybind Key to open command palette (default: super+p)
+---Keybinds are a map from key_string to action name
+---Example: ["<leader>v"] = "split_horizontal"
+---@alias PriseKeybinds table<string, string>
 
 ---@class PriseBordersConfig
 ---@field enabled? boolean Show pane borders (default: false)
@@ -176,7 +170,8 @@ local POWERLINE_SYMBOLS = {
 ---@field borders? PriseBordersConfig Pane border options
 ---@field status_bar? PriseStatusBarConfig Status bar options
 ---@field tab_bar? PriseTabBarConfig Tab bar options
----@field keybinds? PriseKeybinds Keybind configuration
+---@field leader? string Leader key sequence (default: "<D-k>")
+---@field keybinds? PriseKeybinds Keybind definitions
 ---@field macos_option_as_alt? "false"|"left"|"right"|"true" macOS Option key behavior (default: "false")
 
 ---@class PriseConfig
@@ -184,6 +179,7 @@ local POWERLINE_SYMBOLS = {
 ---@field borders PriseBordersConfig
 ---@field status_bar PriseStatusBarConfig
 ---@field tab_bar PriseTabBarConfig
+---@field leader string
 ---@field keybinds PriseKeybinds
 
 -- Default configuration
@@ -221,9 +217,39 @@ local config = {
     tab_bar = {
         show_single_tab = false,
     },
+    leader = "<D-k>",
     keybinds = {
-        leader = { key = "k", super = true },
-        palette = { key = "p", super = true },
+        ["<D-p>"] = "command_palette",
+        ["<leader>v"] = "split_horizontal",
+        ["<leader>s"] = "split_vertical",
+        ["<leader><Enter>"] = "split_auto",
+        ["<leader>h"] = "focus_left",
+        ["<leader>l"] = "focus_right",
+        ["<leader>j"] = "focus_down",
+        ["<leader>k"] = "focus_up",
+        ["<leader>w"] = "close_pane",
+        ["<leader>z"] = "toggle_zoom",
+        ["<leader>t"] = "new_tab",
+        ["<leader>c"] = "close_tab",
+        ["<leader>r"] = "rename_tab",
+        ["<leader>n"] = "next_tab",
+        ["<leader>p"] = "previous_tab",
+        ["<leader>d"] = "detach_session",
+        ["<leader>q"] = "quit",
+        ["<leader>H"] = "resize_left",
+        ["<leader>L"] = "resize_right",
+        ["<leader>J"] = "resize_down",
+        ["<leader>K"] = "resize_up",
+        ["<leader>1"] = "tab_1",
+        ["<leader>2"] = "tab_2",
+        ["<leader>3"] = "tab_3",
+        ["<leader>4"] = "tab_4",
+        ["<leader>5"] = "tab_5",
+        ["<leader>6"] = "tab_6",
+        ["<leader>7"] = "tab_7",
+        ["<leader>8"] = "tab_8",
+        ["<leader>9"] = "tab_9",
+        ["<leader>0"] = "tab_10",
     },
     macos_option_as_alt = "false",
 }
@@ -281,9 +307,23 @@ local state = {
     cached_git_branch = nil,
     -- True when detaching (prevents new timers from being scheduled)
     detaching = false,
+    -- Keybind matcher (initialized by init_keybinds)
+    keybind_matcher = nil,
 }
 
 local M = {}
+
+---Forward declaration for action_handlers (defined after helper functions)
+---@type table<string, fun()>
+local action_handlers
+
+---Initialize keybinds by compiling the trie
+local function init_keybinds()
+    if state.keybind_matcher then
+        return
+    end
+    state.keybind_matcher = prise.keybind.compile(config.keybinds, config.leader)
+end
 
 ---Configure the default UI
 ---@param opts? PriseConfigOptions Configuration options to merge
@@ -291,6 +331,9 @@ function M.setup(opts)
     if opts then
         merge_config(config, opts)
     end
+    -- Re-initialize keybinds if config changed
+    state.keybind_matcher = nil
+    init_keybinds()
 end
 
 ---Get the macos_option_as_alt setting
@@ -302,29 +345,6 @@ end
 local RESIZE_STEP = 0.05 -- 5% step for keyboard resize
 local PALETTE_WIDTH = 60 -- Total width of command palette
 local PALETTE_INNER_WIDTH = 56 -- Inner width (PALETTE_WIDTH - 4 for padding)
-
----Check if a key event matches a keybind
----@param event_data table The event.data from a key_press event
----@param bind PriseKeybind The keybind to match against
----@return boolean
-local function matches_keybind(event_data, bind)
-    if event_data.key ~= bind.key then
-        return false
-    end
-    if (bind.ctrl or false) ~= (event_data.ctrl or false) then
-        return false
-    end
-    if (bind.alt or false) ~= (event_data.alt or false) then
-        return false
-    end
-    if (bind.shift or false) ~= (event_data.shift or false) then
-        return false
-    end
-    if (bind.super or false) ~= (event_data.super or false) then
-        return false
-    end
-    return true
-end
 
 -- --- Helpers ---
 
@@ -1495,6 +1515,133 @@ local commands = {
     },
 }
 
+-- Action handlers for keybind system
+-- Maps action names (from Action enum) to handler functions
+action_handlers = {
+    split_horizontal = function()
+        local pty = get_focused_pty()
+        state.pending_split = { direction = "row" }
+        prise.spawn({ cwd = pty and pty:cwd() })
+    end,
+    split_vertical = function()
+        local pty = get_focused_pty()
+        state.pending_split = { direction = "col" }
+        prise.spawn({ cwd = pty and pty:cwd() })
+    end,
+    split_auto = function()
+        local pty = get_focused_pty()
+        state.pending_split = { direction = get_auto_split_direction() }
+        prise.spawn({ cwd = pty and pty:cwd() })
+    end,
+    focus_left = function()
+        move_focus("left")
+    end,
+    focus_right = function()
+        move_focus("right")
+    end,
+    focus_up = function()
+        move_focus("up")
+    end,
+    focus_down = function()
+        move_focus("down")
+    end,
+    close_pane = function()
+        local root = get_active_root()
+        local path = state.focused_id and find_node_path(root, state.focused_id)
+        if path then
+            local pane = path[#path]
+            pane.pty:close()
+            local was_last = remove_pane_by_id(pane.id)
+            if not was_last then
+                prise.save()
+            end
+        end
+    end,
+    toggle_zoom = function()
+        if state.zoomed_pane_id then
+            state.zoomed_pane_id = nil
+        elseif state.focused_id then
+            state.zoomed_pane_id = state.focused_id
+        end
+        prise.request_frame()
+    end,
+    new_tab = function()
+        local pty = get_focused_pty()
+        state.pending_new_tab = true
+        prise.spawn({ cwd = pty and pty:cwd() })
+    end,
+    close_tab = function()
+        close_current_tab()
+    end,
+    rename_tab = function()
+        open_rename_tab()
+    end,
+    next_tab = function()
+        if #state.tabs > 1 then
+            local next_idx = state.active_tab % #state.tabs + 1
+            set_active_tab_index(next_idx)
+        end
+    end,
+    previous_tab = function()
+        if #state.tabs > 1 then
+            local prev_idx = (state.active_tab - 2 + #state.tabs) % #state.tabs + 1
+            set_active_tab_index(prev_idx)
+        end
+    end,
+    tab_1 = function()
+        set_active_tab_index(1)
+    end,
+    tab_2 = function()
+        set_active_tab_index(2)
+    end,
+    tab_3 = function()
+        set_active_tab_index(3)
+    end,
+    tab_4 = function()
+        set_active_tab_index(4)
+    end,
+    tab_5 = function()
+        set_active_tab_index(5)
+    end,
+    tab_6 = function()
+        set_active_tab_index(6)
+    end,
+    tab_7 = function()
+        set_active_tab_index(7)
+    end,
+    tab_8 = function()
+        set_active_tab_index(8)
+    end,
+    tab_9 = function()
+        set_active_tab_index(9)
+    end,
+    tab_10 = function()
+        set_active_tab_index(10)
+    end,
+    resize_left = function()
+        resize_pane("width", -RESIZE_STEP)
+    end,
+    resize_right = function()
+        resize_pane("width", RESIZE_STEP)
+    end,
+    resize_up = function()
+        resize_pane("height", -RESIZE_STEP)
+    end,
+    resize_down = function()
+        resize_pane("height", RESIZE_STEP)
+    end,
+    detach_session = function()
+        detach_session()
+    end,
+    rename_session = function()
+        open_rename()
+    end,
+    quit = function()
+        detach_session()
+    end,
+    -- command_palette is added after open_palette is defined
+}
+
 ---@param query string
 ---@return Command[]
 local function filter_commands(query)
@@ -1519,6 +1666,11 @@ local function open_palette()
     state.palette.scroll_offset = 0
     state.palette.input:clear()
     prise.request_frame()
+end
+
+-- Add command_palette handler now that open_palette is defined
+action_handlers.command_palette = function()
+    open_palette()
 end
 
 local function close_palette()
@@ -1707,158 +1859,31 @@ function M.update(event)
             return
         end
 
-        -- Open command palette
-        if matches_keybind(event.data, config.keybinds.palette) then
-            open_palette()
+        -- Handle keybinds via matcher
+        init_keybinds()
+        local result = state.keybind_matcher:handle_key(event.data)
+
+        if result.action then
+            -- Cancel any pending timeout
+            if state.timer then
+                state.timer:cancel()
+                state.timer = nil
+            end
+            state.pending_command = false
+
+            -- Dispatch action
+            local handler = action_handlers[result.action]
+            if handler then
+                handler()
+            end
+            prise.request_frame()
             return
-        end
+        elseif result.pending then
+            -- Key sequence in progress
+            state.pending_command = true
+            prise.request_frame()
 
-        -- Handle pending command mode (after Super/Cmd+k)
-        if state.pending_command then
-            local handled = false
-            local k = event.data.key
-
-            -- Leader twice sends leader to inner shell (like tmux)
-            if matches_keybind(event.data, config.keybinds.leader) then
-                local pty = get_focused_pty()
-                if pty then
-                    pty:send_key(event.data)
-                end
-                if state.timer then
-                    state.timer:cancel()
-                    state.timer = nil
-                end
-                state.pending_command = false
-                prise.request_frame()
-                return
-            end
-
-            if k == "h" then
-                move_focus("left")
-                handled = true
-            elseif k == "l" then
-                move_focus("right")
-                handled = true
-            elseif k == "j" then
-                move_focus("down")
-                handled = true
-            elseif k == "k" then
-                move_focus("up")
-                handled = true
-            elseif k == "H" then
-                resize_pane("width", -RESIZE_STEP)
-                handled = true
-            elseif k == "L" then
-                resize_pane("width", RESIZE_STEP)
-                handled = true
-            elseif k == "J" then
-                resize_pane("height", RESIZE_STEP)
-                handled = true
-            elseif k == "K" then
-                resize_pane("height", -RESIZE_STEP)
-                handled = true
-            elseif k == "%" or k == "v" then
-                -- Split horizontal (side-by-side)
-                local pty = get_focused_pty()
-                state.pending_split = { direction = "row" }
-                prise.spawn({ cwd = pty and pty:cwd() })
-                handled = true
-            elseif k == '"' or k == "'" or k == "s" then
-                -- Split vertical (top-bottom)
-                local pty = get_focused_pty()
-                state.pending_split = { direction = "col" }
-                prise.spawn({ cwd = pty and pty:cwd() })
-                handled = true
-            elseif k == "d" then
-                -- Detach from session
-                detach_session()
-                handled = true
-            elseif k == "t" then
-                -- New tab
-                local pty = get_focused_pty()
-                state.pending_new_tab = true
-                prise.spawn({ cwd = pty and pty:cwd() })
-                handled = true
-            elseif k == "n" then
-                -- Next tab
-                if #state.tabs > 1 then
-                    local next_idx = state.active_tab % #state.tabs + 1
-                    set_active_tab_index(next_idx)
-                end
-                handled = true
-            elseif k == "p" then
-                -- Previous tab
-                if #state.tabs > 1 then
-                    local prev_idx = (state.active_tab - 2 + #state.tabs) % #state.tabs + 1
-                    set_active_tab_index(prev_idx)
-                end
-                handled = true
-            elseif k == "c" then
-                -- Close current tab
-                close_current_tab()
-                handled = true
-            elseif k == "r" then
-                -- Rename current tab
-                open_rename_tab()
-                handled = true
-            elseif k >= "1" and k <= "9" then
-                -- Switch to tab N
-                local idx = math.tointeger(tonumber(k))
-                if idx and idx <= #state.tabs then
-                    set_active_tab_index(idx)
-                end
-                handled = true
-            elseif k == "0" then
-                -- Switch to tab 10
-                if 10 <= #state.tabs then
-                    set_active_tab_index(10)
-                end
-                handled = true
-            elseif k == "w" then
-                -- Close current pane
-                local root = get_active_root()
-                local path = state.focused_id and find_node_path(root, state.focused_id)
-                if path then
-                    local pane = path[#path]
-                    pane.pty:close()
-                    local was_last = remove_pane_by_id(pane.id)
-                    if not was_last then
-                        prise.save()
-                    end
-                    handled = true
-                end
-            elseif k == "q" then
-                -- Quit
-                detach_session()
-                handled = true
-            elseif k == "z" then
-                -- Toggle zoom
-                if state.zoomed_pane_id then
-                    state.zoomed_pane_id = nil
-                elseif state.focused_id then
-                    state.zoomed_pane_id = state.focused_id
-                end
-                handled = true
-            elseif k == "Enter" or k == "\r" or k == "\n" then
-                local pty = get_focused_pty()
-                state.pending_split = { direction = get_auto_split_direction() }
-                prise.spawn({ cwd = pty and pty:cwd() })
-                handled = true
-            elseif k == "Escape" then
-                handled = true
-            end
-
-            if handled then
-                if state.timer then
-                    state.timer:cancel()
-                    state.timer = nil
-                end
-                state.pending_command = false
-                prise.request_frame()
-                return
-            end
-
-            -- Reset timeout
+            -- Cancel existing timeout and start new one
             if state.timer then
                 state.timer:cancel()
             end
@@ -1866,23 +1891,21 @@ function M.update(event)
                 if state.pending_command then
                     state.pending_command = false
                     state.timer = nil
+                    state.keybind_matcher:reset()
                     prise.request_frame()
                 end
             end)
             return
         end
 
-        -- Enter command mode (leader key)
-        if matches_keybind(event.data, config.keybinds.leader) then
-            state.pending_command = true
+        -- No match - reset pending state if we were in one
+        if state.pending_command then
+            if state.timer then
+                state.timer:cancel()
+                state.timer = nil
+            end
+            state.pending_command = false
             prise.request_frame()
-            state.timer = prise.set_timeout(1000, function()
-                if state.pending_command then
-                    state.pending_command = false
-                    state.timer = nil
-                    prise.request_frame()
-                end
-            end)
             return
         end
 
@@ -2724,7 +2747,6 @@ end
 
 -- Export internal functions for testing
 M._test = {
-    matches_keybind = matches_keybind,
     is_pane = is_pane,
     is_split = is_split,
     collect_panes = collect_panes,

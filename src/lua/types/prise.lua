@@ -16,6 +16,7 @@
 ---@class prise
 ---@field log PriseLog Logging functions
 ---@field platform "macos"|"linux"|"windows"|"unknown" Current platform
+---@field keybind KeybindModule Keybind compilation and matching
 local prise = {}
 
 ---Load the tiling UI module

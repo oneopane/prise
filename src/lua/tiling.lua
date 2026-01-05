@@ -253,8 +253,8 @@ local config = {
         ["<leader>r"] = "rename_tab",
         ["<leader>n"] = "next_tab",
         ["<leader>p"] = "previous_tab",
-        ["<leader>m"] = "swap_tab_left",
-        ["<leader>,"] = "swap_tab_right",
+        ["<leader><lt>"] = "swap_tab_left",
+        ["<leader><gt>"] = "swap_tab_right",
         ["<leader>d"] = "detach_session",
         ["<leader>q"] = "quit",
         ["<leader>H"] = "resize_left",
@@ -441,6 +441,20 @@ end
 ---@return boolean
 local function is_split(node)
     return node ~= nil and node.type == "split"
+end
+
+---Check if a key is a modifier-only key (Shift, Ctrl, Alt, Super)
+---@param key string
+---@return boolean
+local function is_modifier_key(key)
+    return key == "ShiftLeft"
+        or key == "ShiftRight"
+        or key == "ControlLeft"
+        or key == "ControlRight"
+        or key == "AltLeft"
+        or key == "AltRight"
+        or key == "MetaLeft"
+        or key == "MetaRight"
 end
 
 ---Cancel all timers and detach from session
@@ -2249,6 +2263,12 @@ function M.update(event)
 
         -- Handle keybinds via matcher
         init_keybinds()
+
+        -- Ignore modifier-only key presses (Shift, Ctrl, Alt, Super)
+        if is_modifier_key(event.data.key) then
+            return
+        end
+
         local result = state.keybind_matcher:handle_key(event.data)
 
         if result.action or result.func then
